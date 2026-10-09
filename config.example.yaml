@@ -17,7 +17,7 @@
 # mic_trigger.ignore           这些进程占麦时不录屏。值为进程名，如 SystemSettings.exe。
 #
 # record.follow_mouse          true：画面跟随鼠标所在显示器。false：固定在开录时的那块屏。
-#                              跟随时，成片分辨率是面积最大的那块屏，较小的屏居中。
+#                              跟随时，成片分辨率是面积最大的那块屏。较小的屏等比例缩放后居中，黑边只在上下或左右。
 # record.fps                   帧率，整数 1–60。
 # record.video_bitrate_kbps    视频码率，单位 kbps。0 表示 400。这个值原样送给编码器，不会因分辨率再被抬高。
 # record.encode_max_width      编码最大宽度（像素）。0 表示这一维不限制。

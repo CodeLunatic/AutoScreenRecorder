@@ -261,7 +261,7 @@ static void calc_capture_size(int *out_w, int *out_h) {
 		monitor_capture_size(hmon, out_w, out_h);
 		return;
 	}
-	// 成片分辨率固定为面积最大的那块屏幕。较小的屏 1:1 居中。
+	// 成片分辨率固定为面积最大的那块屏幕。较小的屏等比例缩放后居中，只在上下或左右留黑边。
 	int best_area = 0;
 	int best_w = 0;
 	int best_h = 0;
@@ -751,16 +751,43 @@ static HRESULT write_audio_pcm(IMFSinkWriter *writer, const int16_t *pcm, DWORD 
 
 extern "C" uint64_t monitor_tracker_current(void);
 
-static void draw_cursor_on_canvas(HDC mem, int canvas_w, int canvas_h, const RECT *capture_rc, int blt_dx, int blt_dy) {
+static void fit_into_canvas(int src_w, int src_h, int canvas_w, int canvas_h, int *dst_x, int *dst_y, int *dst_w, int *dst_h) {
+	int dw = src_w;
+	int dh = src_h;
+	if (src_w > 0 && src_h > 0 && canvas_w > 0 && canvas_h > 0) {
+		dw = canvas_w;
+		dh = static_cast<int>(std::llround(static_cast<double>(src_h) * canvas_w / src_w));
+		if (dh > canvas_h) {
+			dh = canvas_h;
+			dw = static_cast<int>(std::llround(static_cast<double>(src_w) * canvas_h / src_h));
+		}
+	}
+	if (dw > canvas_w) dw = canvas_w;
+	if (dh > canvas_h) dh = canvas_h;
+	if (dw < 1) dw = 1;
+	if (dh < 1) dh = 1;
+	*dst_x = (canvas_w - dw) / 2;
+	*dst_y = (canvas_h - dh) / 2;
+	*dst_w = dw;
+	*dst_h = dh;
+}
+
+static int scale_coord(int v, int src, int dst) {
+	if (src <= 0) return 0;
+	return static_cast<int>(std::llround(static_cast<double>(v) * dst / src));
+}
+
+static void draw_cursor_on_canvas(HDC mem, int canvas_w, int canvas_h, const RECT *capture_rc, int dst_x, int dst_y, int src_w, int src_h, int fit_w, int fit_h) {
 	CURSORINFO ci{};
 	ci.cbSize = sizeof(ci);
 	if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING)) return;
 
+	const bool identity = src_w == fit_w && src_h == fit_h;
 	int draw_x = ci.ptScreenPos.x;
 	int draw_y = ci.ptScreenPos.y;
 	if (capture_rc) {
-		draw_x = ci.ptScreenPos.x - capture_rc->left + blt_dx;
-		draw_y = ci.ptScreenPos.y - capture_rc->top + blt_dy;
+		draw_x = dst_x + scale_coord(ci.ptScreenPos.x - capture_rc->left, src_w, fit_w);
+		draw_y = dst_y + scale_coord(ci.ptScreenPos.y - capture_rc->top, src_h, fit_h);
 	} else {
 		draw_x -= GetSystemMetrics(SM_XVIRTUALSCREEN);
 		draw_y -= GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -768,17 +795,23 @@ static void draw_cursor_on_canvas(HDC mem, int canvas_w, int canvas_h, const REC
 
 	ICONINFO ii{};
 	if (GetIconInfo(ci.hCursor, &ii)) {
-		draw_x -= static_cast<int>(ii.xHotspot);
-		draw_y -= static_cast<int>(ii.yHotspot);
+		draw_x -= identity ? static_cast<int>(ii.xHotspot) : scale_coord(static_cast<int>(ii.xHotspot), src_w, fit_w);
+		draw_y -= identity ? static_cast<int>(ii.yHotspot) : scale_coord(static_cast<int>(ii.yHotspot), src_h, fit_h);
 		if (ii.hbmMask) DeleteObject(ii.hbmMask);
 		if (ii.hbmColor) DeleteObject(ii.hbmColor);
 	}
 
-	const int cur_w = GetSystemMetrics(SM_CXCURSOR);
-	const int cur_h = GetSystemMetrics(SM_CYCURSOR);
+	int cur_w = GetSystemMetrics(SM_CXCURSOR);
+	int cur_h = GetSystemMetrics(SM_CYCURSOR);
+	if (!identity) {
+		cur_w = scale_coord(cur_w, src_w, fit_w);
+		cur_h = scale_coord(cur_h, src_h, fit_h);
+		if (cur_w < 1) cur_w = 1;
+		if (cur_h < 1) cur_h = 1;
+	}
 	if (draw_x + cur_w < 0 || draw_y + cur_h < 0 || draw_x >= canvas_w || draw_y >= canvas_h) return;
 
-	DrawIconEx(mem, draw_x, draw_y, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+	DrawIconEx(mem, draw_x, draw_y, ci.hCursor, identity ? 0 : cur_w, identity ? 0 : cur_h, 0, nullptr, DI_NORMAL);
 }
 
 struct CaptureCache {
@@ -858,31 +891,25 @@ static bool capture_frame(std::vector<BYTE> *pixels, int canvas_w, int canvas_h)
 	const int sh = rc.bottom - rc.top;
 	if (sw <= 0 || sh <= 0) return false;
 
-	int src_x = rc.left;
-	int src_y = rc.top;
 	int dst_x = 0;
 	int dst_y = 0;
-	int copy_w = sw;
-	int copy_h = sh;
-	if (sw < canvas_w) dst_x = (canvas_w - sw) / 2;
-	else if (sw > canvas_w) {
-		src_x += (sw - canvas_w) / 2;
-		copy_w = canvas_w;
-	}
-	if (sh < canvas_h) dst_y = (canvas_h - sh) / 2;
-	else if (sh > canvas_h) {
-		src_y += (sh - canvas_h) / 2;
-		copy_h = canvas_h;
-	}
-	if (dst_x != 0 || dst_y != 0 || copy_w != canvas_w || copy_h != canvas_h) {
+	int fit_w = sw;
+	int fit_h = sh;
+	fit_into_canvas(sw, sh, canvas_w, canvas_h, &dst_x, &dst_y, &fit_w, &fit_h);
+	if (fit_w != canvas_w || fit_h != canvas_h) {
 		HBRUSH black = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
 		RECT fill{0, 0, canvas_w, canvas_h};
 		FillRect(g_cap.mem, &fill, black);
 	}
-	if (!BitBlt(g_cap.mem, dst_x, dst_y, copy_w, copy_h, g_cap.screen, src_x, src_y, SRCCOPY | CAPTUREBLT)) {
-		return false;
+	const bool identity = fit_w == sw && fit_h == sh;
+	if (identity) {
+		if (!BitBlt(g_cap.mem, dst_x, dst_y, sw, sh, g_cap.screen, rc.left, rc.top, SRCCOPY | CAPTUREBLT)) return false;
+	} else {
+		SetStretchBltMode(g_cap.mem, HALFTONE);
+		SetBrushOrgEx(g_cap.mem, 0, 0, nullptr);
+		if (!StretchBlt(g_cap.mem, dst_x, dst_y, fit_w, fit_h, g_cap.screen, rc.left, rc.top, sw, sh, SRCCOPY | CAPTUREBLT)) return false;
 	}
-	draw_cursor_on_canvas(g_cap.mem, canvas_w, canvas_h, &rc, dst_x - (src_x - rc.left), dst_y - (src_y - rc.top));
+	draw_cursor_on_canvas(g_cap.mem, canvas_w, canvas_h, &rc, dst_x, dst_y, sw, sh, fit_w, fit_h);
 	memcpy(pixels->data(), g_cap.bits, nbytes);
 	return true;
 }
