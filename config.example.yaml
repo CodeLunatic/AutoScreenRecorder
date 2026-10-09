@@ -14,7 +14,6 @@
 #
 # mic_trigger.watch            占麦后开始录屏的进程。name 为进程名（不区分大小写）。
 #                              可选 path_prefix：可执行文件完整路径前缀，用来区分同名进程。
-# mic_trigger.ignore           这些进程占麦时不录屏。值为进程名，如 SystemSettings.exe。
 #
 # record.follow_mouse          true：画面跟随鼠标所在显示器。false：固定在开录时的那块屏。
 #                              跟随时，成片分辨率是面积最大的那块屏。较小的屏等比例缩放后居中，黑边只在上下或左右。

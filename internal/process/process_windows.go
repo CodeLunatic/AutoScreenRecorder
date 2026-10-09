@@ -60,15 +60,6 @@ func ExecutablePath(pid uint32) (string, error) {
 	return windows.UTF16ToString(buf[:size]), nil
 }
 
-func IsIgnored(exe string, ignore []string) bool {
-	for _, ig := range ignore {
-		if strings.EqualFold(exe, ig) {
-			return true
-		}
-	}
-	return false
-}
-
 func MatchesWatchRule(exeBase, fullPath string, rule config.ProcessRule) bool {
 	if !strings.EqualFold(exeBase, rule.Name) {
 		return false
@@ -97,13 +88,10 @@ func pathHasPrefixBoundary(fullPath, prefix string) bool {
 	return next == '\\' || next == '/'
 }
 
-func MatchesAnyWatch(pid uint32, watch []config.ProcessRule, ignore []string) (bool, string, error) {
+func MatchesAnyWatch(pid uint32, watch []config.ProcessRule) (bool, string, error) {
 	exe, err := ExecutableBaseName(pid)
 	if err != nil {
 		return false, "", err
-	}
-	if IsIgnored(exe, ignore) {
-		return false, exe, nil
 	}
 	path, err := ExecutablePath(pid)
 	if err != nil {

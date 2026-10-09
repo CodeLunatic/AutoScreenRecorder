@@ -15,7 +15,6 @@ AutoScreenRecorder 在 Windows 后台帮你录屏幕。它没有窗口，也不�
 规则就这几条：
 
 - 只有你写进名单的软件会触发录制。没写进去的软件即使用了麦克风，也不会录。
-- 可以再写一份排除名单。改系统麦克风时，系统设置经常会短暂占用设备，把它排除掉，就不会误录。
 - 同一个软件如果同时占着好几路麦克风，要等这些路全部放开，才算结束。
 - 开始和停止都可以各等几秒，免得软件刚碰上麦克风又马上放开，留下一两秒的废片。
 - 从占用到放开，写成一个文件。鼠标移到另一块屏幕，还是录在这同一个视频里。
@@ -140,8 +139,6 @@ mic_trigger:
     # - name: Zoom.exe
     # - name: Feishu.exe
     #   path_prefix: "D:/Feishu/"
-  ignore:
-    - SystemSettings.exe
 
 record:
   follow_mouse: true              # true：录鼠标所在的屏幕。false：一直录开始时的那块

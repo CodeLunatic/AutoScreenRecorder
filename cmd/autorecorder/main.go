@@ -139,7 +139,7 @@ func handleMic(ctrl *controller.Controller, event int, pid uint32) {
 	cfg := ctrl.Config()
 	switch event {
 	case 1:
-		ok, exe, err := process.MatchesAnyWatch(pid, cfg.MicTrigger.Watch, cfg.MicTrigger.Ignore)
+		ok, exe, err := process.MatchesAnyWatch(pid, cfg.MicTrigger.Watch)
 		if err != nil || !ok {
 			return
 		}

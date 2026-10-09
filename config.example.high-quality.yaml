@@ -8,9 +8,10 @@ mic_trigger:
   watch:
     - name: Lark.exe
     - name: Feishu.exe
-  # 这些进程占麦时不录屏。值为进程名。
-  ignore:
-    - SystemSettings.exe
+    - name: Zoom.exe
+    - name: wemeetapp.exe
+    - name: wwmapp.exe
+    - name: Weixin.exe
 
 record:
   # true：画面跟随鼠标所在显示器。false：固定在开录时的那块屏。

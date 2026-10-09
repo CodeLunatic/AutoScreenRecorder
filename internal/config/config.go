@@ -19,8 +19,7 @@ type Config struct {
 }
 
 type MicTrigger struct {
-	Watch  []ProcessRule `yaml:"watch"`
-	Ignore []string      `yaml:"ignore"`
+	Watch []ProcessRule `yaml:"watch"`
 }
 
 type ProcessRule struct {
@@ -71,7 +70,6 @@ func Default() Config {
 				{Name: "Lark.exe"},
 				{Name: "Feishu.exe"},
 			},
-			Ignore: []string{"SystemSettings.exe"},
 		},
 		Record: Record{
 			FollowMouse:      true,
