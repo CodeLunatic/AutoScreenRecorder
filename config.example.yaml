@@ -1,0 +1,45 @@
+# 配置示例索引（复制其一为 config.yaml）
+#
+#   config.example.balanced.yaml     — 折中（推荐：MP4 / 24fps / ~2.5Mbps）
+#   config.example.faststone.yaml    — 小体积（WMV / 15fps / ~400kbps）
+#   config.example.high-quality.yaml — 高画质（MP4 / 30fps / ~8Mbps）
+#
+#   Copy-Item config.example.balanced.yaml config.yaml
+#   Copy-Item config.example.faststone.yaml config.yaml
+#   Copy-Item config.example.high-quality.yaml config.yaml
+#
+# 音频编码不随配置变化：始终 48 kHz 立体声、320 kbps（MP4 为 AAC，WMV 为 WMA）。
+#
+# 配置项说明（各示例文件里也有同样注释）：
+#
+# mic_trigger.watch            占麦后开始录屏的进程。name 为进程名（不区分大小写）。
+#                              可选 path_prefix：可执行文件完整路径前缀，用来区分同名进程。
+# mic_trigger.ignore           这些进程占麦时不录屏。值为进程名，如 SystemSettings.exe。
+#
+# record.follow_mouse          true：画面跟随鼠标所在显示器。false：固定在开录时的那块屏。
+#                              跟随时，成片分辨率是面积最大的那块屏，较小的屏居中。
+# record.fps                   帧率，整数 1–60。
+# record.video_bitrate_kbps    视频码率，单位 kbps。0 表示 400。这个值原样送给编码器，不会因分辨率再被抬高。
+# record.encode_max_width      编码最大宽度（像素）。0 表示这一维不限制。
+# record.encode_max_height     编码最大高度（像素）。0 表示这一维不限制。两边都为 0 时不缩小。
+# record.container             容器。mp4 或 h264：MP4/H.264。wmv 或其他值：WMV。
+#
+# audio.enabled                true/false。总开关，false 时不录音频。
+# audio.system.enabled         true/false。是否录系统默认扬声器。录制中更换 Windows 默认播放设备时会跟着切换。
+# audio.microphone.enabled     true/false。是否录系统默认麦克风。录制中更换 Windows 默认录音设备时会跟着切换。
+#                              占麦检测也会改到新的默认麦克风。
+# audio.gain.system_db         系统声音量，单位 dB。0 为原音量，负数变小，正数变大。
+# audio.gain.microphone_db     麦克风音量，单位 dB。0 为原音量，负数变小，正数变大。
+# audio.clip_limit             true/false。true 时混音超出 [-1, 1] 的采样直接削顶。false 时先把这一小段整体压低，避免硬削顶。
+#
+# output.dir                   保存目录。支持 %USERPROFILE%。
+# output.template              文件名模板。占位符：
+#                              {datetime} 开始时间，精确到分钟，如 202610082222
+#                              {date}     日期，如 2026-10-08
+#                              {time}     时间，如 22-22-21
+#                              {process}  触发进程名（去掉 .exe）
+#                              同一分钟内重名会自动变成 name_2、name_3，不会覆盖已有文件。
+#                              扩展名建议与 container 一致（.mp4 或 .wmv）；不写扩展名时按 container 补上。
+#
+# service.start_delay_sec      占麦后延迟多少秒再开始录，整数，建议 >= 0。
+# service.stop_delay_sec       麦克风都释放后延迟多少秒再停止，整数，必须 >= 0。

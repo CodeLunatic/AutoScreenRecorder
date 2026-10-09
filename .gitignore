@@ -1,0 +1,46 @@
+# 本地配置（示例 config.example*.yaml 保留在仓库）
+config.yaml
+
+# 构建产物
+AutoScreenRecorder.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+*.test
+*.out
+coverage.out
+coverage.html
+/vendor/
+
+# CGO / 本地编译中间文件
+*.o
+*.obj
+*.a
+*.lib
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 日志与临时录制（若在项目目录内调试）
+*.log
+*.tmp.mp4
+*.tmp.wmv
+*.tmp.asf
+
+# 环境 / 密钥
+.env
+.env.*
+!.env.example
