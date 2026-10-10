@@ -1,6 +1,5 @@
 # 折中：体积与清晰度平衡（推荐日常 Lark 会议录屏）
 # 使用：Copy-Item config.example.balanced.yaml config.yaml
-# 音频：48 kHz 立体声。MP4 的 AAC 为动态码率，平均 320 kbps；WMV 的 WMA 仍是固定 320 kbps。不在此配置。
 
 mic_trigger:
   # 占麦后开始录屏的进程。name：进程名，不区分大小写。
@@ -24,12 +23,28 @@ record:
   # 编码最大宽/高（像素）。0 表示不缩小。两者都大于 0 时才按比例缩小。
   encode_max_width: 0
   encode_max_height: 0
-  # 容器：mp4 或 h264 = MP4/H.265，显卡打不开时改用 H.264；wmv 或其他值 = WMV。
+  # 容器：mp4 或 h264 = MP4；wmv 或其他值 = WMV。
   container: mp4
+  # 视频编码。hevc：先 H.265，打不开再 H.264。h264：只用 H.264。容器为 wmv 时忽略。
+  codec: hevc
+  # vbr：动态码率，静止画面更低。cbr：固定在 video_bitrate_kbps。
+  bitrate_mode: vbr
+  # 动态码率最高值（kbps）。0 表示平均码率的两倍。不能低于平均码率。
+  video_peak_bitrate_kbps: 0
+  # 关键帧间隔，秒。0 表示 5。范围 0–30。
+  keyframe_sec: 5
 
 audio:
   # true/false。总开关，false 时不录音频。
   enabled: true
+  # 平均码率（kbps）。0 表示 320。范围 0–512。
+  bitrate_kbps: 96
+  # 采样率。44100 或 48000。0 表示 48000。
+  sample_rate: 48000
+  # 声道。1 为单声道，2 为立体声。0 表示 2。
+  channels: 1
+  # vbr：MP4 的 AAC 尝试动态码率。cbr：固定码率。WMV 的 WMA 始终是固定码率。
+  bitrate_mode: vbr
   system:
     # true/false。是否录系统默认扬声器。录制中更换 Windows 默认播放设备时会跟着切换。
     enabled: true

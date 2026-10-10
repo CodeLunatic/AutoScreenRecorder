@@ -23,6 +23,26 @@ func TestValidateDelays(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected negative bitrate to fail")
 	}
+	cfg = Default()
+	cfg.Record.Codec = "vp9"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unknown codec to fail")
+	}
+	cfg = Default()
+	cfg.Record.VideoPeakBitrateKbps = 100
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected peak below average to fail")
+	}
+	cfg = Default()
+	cfg.Audio.SampleRate = 22050
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unsupported sample rate to fail")
+	}
+	cfg = Default()
+	cfg.Audio.Channels = 6
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unsupported channel count to fail")
+	}
 }
 
 func TestLoadMissingFile(t *testing.T) {

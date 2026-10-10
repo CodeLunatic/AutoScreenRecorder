@@ -46,7 +46,9 @@ AutoScreenRecorder 在 Windows 后台帮你录屏幕。它没有窗口，也不�
 
 声音默认有两路：电脑放出来的声音，以及麦克风里的声音，混在一条音轨里。两路都可以单独关掉，也可以分别调大或调小。录到一半时，你如果更换了系统默认的喇叭或麦克风，录音会跟着换过去。
 
-声音是立体声。保存成 MP4 时用 AAC，安静时码率更低，说话或放视频时升高，平均大约 320 kbps。保存成 WMV 时用 WMA，码率固定在 320 kbps。音质不用在配置里改。
+声音可以在配置里改码率、采样率和声道。采样率用 44100 或 48000，声道用 1 或 2，码率填 0 时按 320 kbps。保存成 MP4 时用 AAC，`bitrate_mode: vbr` 时安静画面对应的声音会少用一些码率；编码器不接受就退回固定码率。保存成 WMV 时用 WMA，码率固定。
+
+视频在 MP4 里默认先用 H.265，显卡打不开再改用 H.264。`codec: h264` 则只用 H.264。`bitrate_mode: vbr` 时静止画面码率更低，最高到 `video_peak_bitrate_kbps`，填 0 就是平均码率的两倍。`cbr` 则整段按平均码率。关键帧间隔用 `keyframe_sec`，填 0 是 5 秒。
 
 如果 Windows 禁止本程序使用麦克风，它就既录不到麦克风，也看不到谁在占用麦克风，录制不会开始。到「设置 → 隐私和安全性 → 麦克风」里允许它。
 
@@ -146,10 +148,18 @@ record:
   video_bitrate_kbps: 2500        # 平均码率。静止画面更低，变化大时最高到两倍。0 等于 400
   encode_max_width: 0             # 画面最宽多少像素。0 表示不缩小
   encode_max_height: 0            # 画面最高多少像素。0 表示不缩小
-  container: mp4                  # mp4 得到 H.265，显卡打不开时改用 H.264；wmv 得到 wmv
+  container: mp4                  # mp4 得到 MP4；wmv 得到 wmv
+  codec: hevc                     # hevc：先 H.265，不行再用 H.264。h264：只用 H.264
+  bitrate_mode: vbr               # vbr：动态码率。cbr：固定码率
+  video_peak_bitrate_kbps: 0      # 动态码率最高值。0 等于平均码率的两倍
+  keyframe_sec: 5                 # 关键帧间隔，秒。0 等于 5
 
 audio:
   enabled: true                   # false：只录画面，不录声音
+  bitrate_kbps: 320               # 平均码率。0 等于 320
+  sample_rate: 48000              # 44100 或 48000
+  channels: 2                     # 1 单声道，2 立体声
+  bitrate_mode: vbr               # MP4 的 AAC。vbr 会随声音忙闲变化。WMV 仍是固定码率
   system:
     enabled: true                 # 是否录电脑放出来的声音
   microphone:

@@ -22,6 +22,14 @@ typedef struct native_rec_config {
 	float gain_system_db;
 	float gain_mic_db;
 	int clip_limit;
+	int video_codec;
+	int video_bitrate_mode;
+	int video_peak_bitrate_kbps;
+	int keyframe_sec;
+	int audio_bitrate_kbps;
+	int audio_sample_rate;
+	int audio_channels;
+	int audio_bitrate_mode;
 } native_rec_config;
 
 int native_start(native_mic_cb mic, native_monitor_cb mon);

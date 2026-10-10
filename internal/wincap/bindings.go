@@ -147,8 +147,8 @@ func (n *NativeRecorder) Start(_ context.Context, path string, monitorHandle uin
 	if mon == 0 {
 		mon = CurrentMonitor()
 	}
-	log.Printf("开始录制 path=%s monitor=%d fps=%d bitrate=%dkbps container=%s audio=%t",
-		path, mon, cfg.Record.FPS, cfg.Record.VideoBitrateKbps, cfg.Record.Container, cfg.Audio.Enabled)
+	log.Printf("开始录制 path=%s monitor=%d fps=%d bitrate=%dkbps peak=%dkbps codec=%s video_mode=%s container=%s audio=%t audio_bitrate=%dkbps rate=%d ch=%d audio_mode=%s",
+		path, mon, cfg.Record.FPS, cfg.Record.VideoBitrateKbps, cfg.Record.VideoPeakBitrateKbps, cfg.Record.Codec, cfg.Record.BitrateMode, cfg.Record.Container, cfg.Audio.Enabled, cfg.Audio.BitrateKbps, cfg.Audio.SampleRate, cfg.Audio.Channels, cfg.Audio.BitrateMode)
 	NativeTrace(fmt.Sprintf("Go: start path=%s monitor=%d fps=%d bitrate=%d container=%s",
 		path, mon, cfg.Record.FPS, cfg.Record.VideoBitrateKbps, cfg.Record.Container))
 	r := C.native_start_recording(cpath, C.ulonglong(mon), &nc)
@@ -262,6 +262,25 @@ func toNativeRecConfig(cfg config.Config) C.native_rec_config {
 		kbps = 400
 	}
 	nc.video_bitrate_kbps = C.int(kbps)
+	if strings.EqualFold(strings.TrimSpace(cfg.Record.BitrateMode), "cbr") {
+		nc.video_bitrate_mode = 1
+	}
+	peak := cfg.Record.VideoPeakBitrateKbps
+	if peak < 0 {
+		peak = 0
+	}
+	nc.video_peak_bitrate_kbps = C.int(peak)
+	switch strings.ToLower(strings.TrimSpace(cfg.Record.Codec)) {
+	case "h264", "avc":
+		nc.video_codec = 1
+	default:
+		nc.video_codec = 0
+	}
+	keyframe := cfg.Record.KeyframeSec
+	if keyframe <= 0 {
+		keyframe = 5
+	}
+	nc.keyframe_sec = C.int(keyframe)
 	nc.encode_max_width = C.int(cfg.Record.EncodeMaxWidth)
 	nc.encode_max_height = C.int(cfg.Record.EncodeMaxHeight)
 	switch strings.ToLower(strings.TrimSpace(cfg.Record.Container)) {
@@ -272,6 +291,25 @@ func toNativeRecConfig(cfg config.Config) C.native_rec_config {
 	}
 	if a.Enabled {
 		nc.audio_enabled = 1
+	}
+	audioKbps := a.BitrateKbps
+	if audioKbps <= 0 {
+		audioKbps = 320
+	}
+	nc.audio_bitrate_kbps = C.int(audioKbps)
+	switch a.SampleRate {
+	case 44100, 48000:
+		nc.audio_sample_rate = C.int(a.SampleRate)
+	default:
+		nc.audio_sample_rate = 48000
+	}
+	if a.Channels == 1 {
+		nc.audio_channels = 1
+	} else {
+		nc.audio_channels = 2
+	}
+	if strings.EqualFold(strings.TrimSpace(a.BitrateMode), "cbr") {
+		nc.audio_bitrate_mode = 1
 	}
 	if a.System.Enabled {
 		nc.system_enabled = 1

@@ -159,16 +159,25 @@ static void cap_encode_size(int *w, int *h) {
 	*h = even_dim(static_cast<int>(*h * s));
 }
 
+static int audio_channels(void) {
+	return g_cfg.audio_channels == 1 ? 1 : 2;
+}
+
 static int audio_sample_rate_hz(void) {
+	if (g_cfg.audio_sample_rate == 44100 || g_cfg.audio_sample_rate == 48000) return g_cfg.audio_sample_rate;
 	return 48000;
 }
 
+static int audio_bitrate_kbps_value(void) {
+	return g_cfg.audio_bitrate_kbps > 0 ? g_cfg.audio_bitrate_kbps : 320;
+}
+
 static int audio_bitrate_bytes_per_sec(void) {
-	return 320 * 1000 / 8;
+	return audio_bitrate_kbps_value() * 1000 / 8;
 }
 
 static UINT32 audio_bitrate_bps(void) {
-	return 320 * 1000U;
+	return static_cast<UINT32>(audio_bitrate_kbps_value()) * 1000U;
 }
 
 // Windows AAC 动态码率开关。必须写在输出类型上，编码器收到类型之前才会生效。
@@ -186,9 +195,18 @@ static UINT32 video_bitrate_bps(void) {
 }
 
 static UINT32 video_peak_bitrate_bps(void) {
+	if (g_cfg.video_peak_bitrate_kbps > 0) {
+		return static_cast<UINT32>(g_cfg.video_peak_bitrate_kbps) * 1000U;
+	}
 	const UINT64 peak = static_cast<UINT64>(video_bitrate_bps()) * 2;
 	if (peak > 0xFFFFFFFFu) return 0xFFFFFFFFu;
 	return static_cast<UINT32>(peak);
+}
+
+static int keyframe_spacing_frames(int fps) {
+	const int sec = g_cfg.keyframe_sec > 0 ? g_cfg.keyframe_sec : 5;
+	if (fps <= 0) return sec * 15;
+	return fps * sec;
 }
 
 // MinGW 没有 codecapi.h，按 Windows 的 ICodecAPI 虚表声明编码器接口。
@@ -656,7 +674,7 @@ static HRESULT create_wmv_once(const wchar_t *path, int width, int height, int f
 		out_a->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
 		const GUID wma = ac.wma_v9 ? MFAudioFormat_WMAudioV9 : MFAudioFormat_WMAudioV8;
 		out_a->SetGUID(MF_MT_SUBTYPE, wma);
-		out_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+		out_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, static_cast<UINT32>(audio_channels()));
 		out_a->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, static_cast<UINT32>(asr));
 		out_a->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
 		{
@@ -671,18 +689,18 @@ static HRESULT create_wmv_once(const wchar_t *path, int width, int height, int f
 		if (FAILED(hr)) return fail(hr);
 		in_a->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
 		in_a->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-		in_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+		in_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, static_cast<UINT32>(audio_channels()));
 		in_a->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, static_cast<UINT32>(asr));
 		in_a->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-		in_a->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
-		in_a->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, static_cast<UINT32>(asr * 4));
+		in_a->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, static_cast<UINT32>(audio_channels() * 2));
+		in_a->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, static_cast<UINT32>(asr * audio_channels() * 2));
 		hr = writer->SetInputMediaType(g_a_stream, in_a, nullptr);
 		in_a->Release();
 		if (FAILED(hr)) return fail(hr);
 		g_with_audio.store(true);
 	}
 
-	apply_dynamic_bitrate(writer);
+	if (g_cfg.video_bitrate_mode != 1) apply_dynamic_bitrate(writer);
 	hr = writer->BeginWriting();
 	if (FAILED(hr)) return fail(hr);
 	g_last_mf_hr.store(S_OK);
@@ -695,15 +713,15 @@ static HRESULT create_wmv_writer(const wchar_t *path, int width, int height, int
 	g_encode_audio_rate_hz = 0;
 
 	const wmv_attempt_cfg attempts[] = {
-		{MFVideoFormat_WVC1, true, true, true, true, 48000, 0},
+		{MFVideoFormat_WVC1, true, true, true, true, 0, 0},
 		{MFVideoFormat_WVC1, true, true, false, true, 0, 0},
-		{MFVideoFormat_WVC1, true, false, true, true, 48000, 0},
+		{MFVideoFormat_WVC1, true, false, true, true, 0, 0},
 		{MFVideoFormat_WVC1, true, false, false, true, 0, 0},
-		{MFVideoFormat_WMV3, true, true, true, true, 48000, 0},
+		{MFVideoFormat_WMV3, true, true, true, true, 0, 0},
 		{MFVideoFormat_WMV3, true, true, false, true, 0, 0},
-		{MFVideoFormat_WMV3, false, true, true, true, 48000, 0},
+		{MFVideoFormat_WMV3, false, true, true, true, 0, 0},
 		{MFVideoFormat_WMV3, false, true, false, true, 0, 0},
-		{MFVideoFormat_WVC1, true, true, true, true, 48000, 30},
+		{MFVideoFormat_WVC1, true, true, true, true, 0, 30},
 		{MFVideoFormat_WMV3, true, true, false, true, 0, 30},
 	};
 
@@ -766,7 +784,7 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 		out_v->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
 		out_v->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
 		out_v->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
-		out_v->SetUINT32(MF_MT_MAX_KEYFRAME_SPACING, static_cast<UINT32>(fps > 0 ? fps * 5 : 75));
+		out_v->SetUINT32(MF_MT_MAX_KEYFRAME_SPACING, static_cast<UINT32>(keyframe_spacing_frames(fps)));
 	}
 	if (!is_hevc_codec(opts.codec) && opts.h264_extended_attrs) {
 		out_v->SetUINT32(MF_MT_MPEG2_PROFILE, 77); // Main
@@ -809,7 +827,7 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 			if (FAILED(created)) return created;
 			out_a->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
 			out_a->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-			out_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+			out_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, static_cast<UINT32>(audio_channels()));
 			out_a->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, static_cast<UINT32>(audio_sample_rate_hz()));
 			out_a->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
 			out_a->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, static_cast<UINT32>(audio_bitrate_bytes_per_sec()));
@@ -822,8 +840,9 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 			}
 			return added;
 		};
-		hr = add_aac(true);
-		if (FAILED(hr)) {
+		const bool want_vbr = g_cfg.audio_bitrate_mode == 0;
+		hr = add_aac(want_vbr);
+		if (FAILED(hr) && want_vbr) {
 			tracef("aac: vbr rejected hr=0x%08lX, retry cbr", static_cast<unsigned long>(hr));
 			hr = add_aac(false);
 		}
@@ -837,13 +856,14 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 		if (FAILED(hr)) return fail(hr);
 		in_a->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
 		in_a->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-		in_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+		in_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, static_cast<UINT32>(audio_channels()));
 		{
 			const UINT32 asr = static_cast<UINT32>(audio_sample_rate_hz());
+			const UINT32 block = static_cast<UINT32>(audio_channels() * 2);
 			in_a->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, asr);
 			in_a->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-			in_a->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
-			in_a->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, asr * 4);
+			in_a->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, block);
+			in_a->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, asr * block);
 		}
 		hr = writer->SetInputMediaType(g_a_stream, in_a, nullptr);
 		in_a->Release();
@@ -856,7 +876,7 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 		g_with_audio.store(true);
 	}
 
-	if (!apply_dynamic_bitrate(writer) && opts.hw_accel && !is_hevc_codec(opts.codec)) {
+	if (g_cfg.video_bitrate_mode != 1 && !apply_dynamic_bitrate(writer) && opts.hw_accel && !is_hevc_codec(opts.codec)) {
 		tracef("rate control: hardware encoder rejected dynamic bitrate");
 		return fail(E_NOTIMPL);
 	}
@@ -887,25 +907,29 @@ static HRESULT create_writer(const wchar_t *path, int width, int height, int fps
 	g_h264_nv12 = false;
 	g_encode_audio_rate_hz = 0;
 
-	const writer_create_opts hevc_attempts[] = {
-		{true, true, false, false, kCodecHEVC},
-		{true, true, false, true, kCodecHEVC},
-		{true, true, false, true, kCodecH265},
-	};
 	HRESULT hr = E_FAIL;
-	for (size_t i = 0; i < sizeof(hevc_attempts) / sizeof(hevc_attempts[0]); i++) {
-		const writer_create_opts &opts = hevc_attempts[i];
-		tracef("create_writer: hevc attempt %u hw=%d mpeg4=%d minimal=%d fourcc=%s",
-			static_cast<unsigned>(i + 1), opts.hw_accel ? 1 : 0, opts.mpeg4_container ? 1 : 0,
-			opts.minimal_type ? 1 : 0, opts.codec == kCodecH265 ? "H265" : "HEVC");
-		hr = create_h264_mp4_writer_internal(path, width, height, fps, with_audio, opts, out);
-		if (SUCCEEDED(hr)) {
-			crash_log_trace("create_writer: hevc ok");
-			return hr;
+	if (g_cfg.video_codec != 1) {
+		const writer_create_opts hevc_attempts[] = {
+			{true, true, false, false, kCodecHEVC},
+			{true, true, false, true, kCodecHEVC},
+			{true, true, false, true, kCodecH265},
+		};
+		for (size_t i = 0; i < sizeof(hevc_attempts) / sizeof(hevc_attempts[0]); i++) {
+			const writer_create_opts &opts = hevc_attempts[i];
+			tracef("create_writer: hevc attempt %u hw=%d mpeg4=%d minimal=%d fourcc=%s",
+				static_cast<unsigned>(i + 1), opts.hw_accel ? 1 : 0, opts.mpeg4_container ? 1 : 0,
+				opts.minimal_type ? 1 : 0, opts.codec == kCodecH265 ? "H265" : "HEVC");
+			hr = create_h264_mp4_writer_internal(path, width, height, fps, with_audio, opts, out);
+			if (SUCCEEDED(hr)) {
+				crash_log_trace("create_writer: hevc ok");
+				return hr;
+			}
+			tracef("create_writer: hevc attempt %u failed hr=0x%08lX", static_cast<unsigned>(i + 1), static_cast<unsigned long>(hr));
 		}
-		tracef("create_writer: hevc attempt %u failed hr=0x%08lX", static_cast<unsigned>(i + 1), static_cast<unsigned long>(hr));
+		crash_log_trace("create_writer: hevc unavailable, falling back to h264");
+	} else {
+		crash_log_trace("create_writer: h264 only");
 	}
-	crash_log_trace("create_writer: hevc unavailable, falling back to h264");
 
 	static const writer_create_opts attempts[] = {
 		{true, true, false, false, kCodecH264},
@@ -981,7 +1005,8 @@ static HRESULT write_video_frame(IMFSinkWriter *writer, const BYTE *pixels, LONG
 }
 
 static HRESULT write_audio_pcm(IMFSinkWriter *writer, const int16_t *pcm, DWORD frames, LONGLONG ts100ns) {
-	DWORD cb = frames * 2 * sizeof(int16_t);
+	const int ch = audio_channels();
+	DWORD cb = frames * static_cast<DWORD>(ch) * sizeof(int16_t);
 	IMFMediaBuffer *buf = nullptr;
 	HRESULT hr = MFCreateMemoryBuffer(cb, &buf);
 	if (FAILED(hr)) return hr;
@@ -1915,12 +1940,23 @@ static bool drain_and_mix(WasapiCapture *sys, WasapiCapture *mic, std::vector<fl
 	if (use_mic) consume_audio_hold(mic_hold, n);
 
 	shape_mix(mix.data(), mix.size());
-	pcm_out->resize(mix.size());
-	for (size_t i = 0; i < mix.size(); i++) {
-		float v = mix[i];
-		if (v > 1.f) v = 1.f;
-		if (v < -1.f) v = -1.f;
-		(*pcm_out)[i] = static_cast<int16_t>(v * 32767.f);
+	const int ch = audio_channels();
+	if (ch == 1) {
+		pcm_out->resize(n);
+		for (UINT32 i = 0; i < n; i++) {
+			float v = 0.5f * (mix[static_cast<size_t>(i) * 2] + mix[static_cast<size_t>(i) * 2 + 1]);
+			if (v > 1.f) v = 1.f;
+			if (v < -1.f) v = -1.f;
+			(*pcm_out)[i] = static_cast<int16_t>(v * 32767.f);
+		}
+	} else {
+		pcm_out->resize(mix.size());
+		for (size_t i = 0; i < mix.size(); i++) {
+			float v = mix[i];
+			if (v > 1.f) v = 1.f;
+			if (v < -1.f) v = -1.f;
+			(*pcm_out)[i] = static_cast<int16_t>(v * 32767.f);
+		}
 	}
 	*out_frames = n;
 	return true;
@@ -2305,9 +2341,11 @@ int recorder_start(const wchar_t *path, uint64_t hmon, const native_rec_config *
 	g_hmon.store(hmon ? hmon : monitor_tracker_current());
 	g_final_path = path;
 	g_write_path = temp_recording_path(g_final_path);
-	tracef("recorder_start: fps=%d wmv=%d bitrate_kbps=%d audio=%d follow=%d hmon=%llu",
-		g_cfg.fps, g_cfg.use_wmv ? 1 : 0, g_cfg.video_bitrate_kbps,
+	tracef("recorder_start: fps=%d codec=%d vbr=%d bitrate_kbps=%d peak_kbps=%d keyframe_sec=%d audio=%d rate=%d ch=%d audio_kbps=%d audio_vbr=%d follow=%d hmon=%llu",
+		g_cfg.fps, g_cfg.video_codec, g_cfg.video_bitrate_mode == 0 ? 1 : 0, g_cfg.video_bitrate_kbps,
+		g_cfg.video_peak_bitrate_kbps, g_cfg.keyframe_sec,
 		(g_cfg.audio_enabled && (g_cfg.system_enabled || g_cfg.mic_enabled)) ? 1 : 0,
+		audio_sample_rate_hz(), audio_channels(), audio_bitrate_kbps_value(), g_cfg.audio_bitrate_mode == 0 ? 1 : 0,
 		g_cfg.follow_mouse ? 1 : 0, static_cast<unsigned long long>(g_hmon.load()));
 	trace_wpath("recorder_start final:", g_final_path.c_str());
 	trace_wpath("recorder_start temp:", g_write_path.c_str());

@@ -8,7 +8,16 @@
 #   Copy-Item config.example.faststone.yaml config.yaml
 #   Copy-Item config.example.high-quality.yaml config.yaml
 #
-# 音频编码不随配置变化：始终 48 kHz 立体声。MP4 的 AAC 为动态码率，平均 320 kbps，安静时更低；编码器不接受时退回固定 320 kbps。WMV 的 WMA 仍是固定 320 kbps。
+# 音频：采样率 44100 或 48000，声道 1 或 2，码率 0–512 kbps（0 表示 320）。MP4 的 AAC 可设 vbr 或 cbr。WMV 的 WMA 始终是固定码率。
+#
+# record.codec                 hevc：MP4 先用 H.265，打不开再 H.264。h264：只用 H.264。容器为 wmv 时忽略。
+# record.bitrate_mode          vbr：动态码率。cbr：固定码率。
+# record.video_peak_bitrate_kbps  动态码率最高值，kbps。0 表示平均码率的两倍，且不能低于平均码率。
+# record.keyframe_sec          关键帧间隔，秒。0 表示 5。范围 0–30。
+# audio.bitrate_kbps           音频平均码率，kbps。0 表示 320。范围 0–512。
+# audio.sample_rate            44100 或 48000。0 表示 48000。
+# audio.channels               1 或 2。0 表示 2。
+# audio.bitrate_mode           vbr 或 cbr。只影响 MP4 的 AAC。
 #
 # 配置项说明（各示例文件里也有同样注释）：
 #
@@ -21,7 +30,7 @@
 # record.video_bitrate_kbps    视频平均码率，单位 kbps。0 表示 400。动态码率：画面静止时更低，变化大时最高到两倍。不会因分辨率再被抬高。
 # record.encode_max_width      编码最大宽度（像素）。0 表示这一维不限制。
 # record.encode_max_height     编码最大高度（像素）。0 表示这一维不限制。两边都为 0 时不缩小。
-# record.container             容器。mp4 或 h264：MP4，视频为 H.265，显卡打不开时改用 H.264。wmv 或其他值：WMV。
+# record.container             容器。mp4 或 h264：MP4。wmv 或其他值：WMV。
 #
 # audio.enabled                true/false。总开关，false 时不录音频。
 # audio.system.enabled         true/false。是否录系统默认扬声器。录制中更换 Windows 默认播放设备时会跟着切换。
