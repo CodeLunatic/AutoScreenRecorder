@@ -21,7 +21,7 @@
 # record.video_bitrate_kbps    视频平均码率，单位 kbps。0 表示 400。动态码率：画面静止时更低，变化大时最高到两倍。不会因分辨率再被抬高。
 # record.encode_max_width      编码最大宽度（像素）。0 表示这一维不限制。
 # record.encode_max_height     编码最大高度（像素）。0 表示这一维不限制。两边都为 0 时不缩小。
-# record.container             容器。mp4 或 h264：MP4/H.264。wmv 或其他值：WMV。
+# record.container             容器。mp4 或 h264：MP4，视频为 H.265，显卡打不开时改用 H.264。wmv 或其他值：WMV。
 #
 # audio.enabled                true/false。总开关，false 时不录音频。
 # audio.system.enabled         true/false。是否录系统默认扬声器。录制中更换 Windows 默认播放设备时会跟着切换。

@@ -1,4 +1,4 @@
-# 高画质：原生分辨率 MP4/H.264、30fps、较高码率，文字与动效更清晰
+# 高画质：原生分辨率 MP4/H.265、30fps、较高码率，文字与动效更清晰
 # 使用：Copy-Item config.example.high-quality.yaml config.yaml
 # 音频：48 kHz 立体声。MP4 的 AAC 为动态码率，平均 320 kbps；WMV 的 WMA 仍是固定 320 kbps。不在此配置。
 
@@ -24,7 +24,7 @@ record:
   # 编码最大宽/高（像素）。0 表示不缩小。两者都大于 0 时才按比例缩小。
   encode_max_width: 0
   encode_max_height: 0
-  # 容器：mp4 或 h264 = MP4/H.264；wmv 或其他值 = WMV。
+  # 容器：mp4 或 h264 = MP4/H.265，显卡打不开时改用 H.264；wmv 或其他值 = WMV。
   container: mp4
 
 audio:

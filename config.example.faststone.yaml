@@ -24,7 +24,7 @@ record:
   # 编码最大宽/高（像素）。0 表示不缩小。两者都大于 0 时才按比例缩小。
   encode_max_width: 0
   encode_max_height: 0
-  # 容器：mp4 或 h264 = MP4/H.264；wmv 或其他值 = WMV。
+  # 容器：mp4 或 h264 = MP4/H.265，显卡打不开时改用 H.264；wmv 或其他值 = WMV。
   container: wmv
 
 audio:

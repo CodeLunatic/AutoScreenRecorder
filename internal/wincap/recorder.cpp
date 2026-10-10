@@ -532,11 +532,39 @@ static void clamp_audio(float *s, size_t n) {
 	}
 }
 
+enum {
+	kCodecH264 = 0,
+	kCodecHEVC = 1,
+	kCodecH265 = 2
+};
+
+// MinGW 的头文件没有这两个子类型。
+static const GUID kVideoFormatHEVC = {
+	0x43564548, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+static const GUID kVideoFormatH265 = {
+	0x35363248, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+
 struct writer_create_opts {
 	bool hw_accel;
 	bool mpeg4_container;
 	bool h264_extended_attrs;
+	bool minimal_type;
+	int codec;
 };
+
+static bool is_hevc_codec(int codec) {
+	return codec == kCodecHEVC || codec == kCodecH265;
+}
+
+static const char *codec_name(int codec) {
+	return is_hevc_codec(codec) ? "hevc" : "h264";
+}
+
+static GUID video_subtype(int codec) {
+	if (codec == kCodecH265) return kVideoFormatH265;
+	if (codec == kCodecHEVC) return kVideoFormatHEVC;
+	return MFVideoFormat_H264;
+}
 
 struct wmv_attempt_cfg {
 	GUID video_out;
@@ -709,15 +737,15 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 	if (attrs) attrs->Release();
 	if (FAILED(hr)) {
 		g_last_mf_hr.store(hr);
-		tracef("h264 sink writer failed hr=0x%08lX hw=%d %dx%d", static_cast<unsigned long>(hr), opts.hw_accel ? 1 : 0, width, height);
+		tracef("%s sink writer failed hr=0x%08lX hw=%d %dx%d", codec_name(opts.codec), static_cast<unsigned long>(hr), opts.hw_accel ? 1 : 0, width, height);
 		return hr;
 	}
 
 	auto fail = [&](HRESULT e) -> HRESULT {
 		g_last_mf_hr.store(e);
-		tracef("h264 writer failed hr=0x%08lX hw=%d mpeg4=%d ext=%d %dx%d fps=%d",
-			static_cast<unsigned long>(e), opts.hw_accel ? 1 : 0, opts.mpeg4_container ? 1 : 0,
-			opts.h264_extended_attrs ? 1 : 0, width, height, fps);
+		tracef("%s writer failed hr=0x%08lX hw=%d mpeg4=%d ext=%d minimal=%d %dx%d fps=%d",
+			codec_name(opts.codec), static_cast<unsigned long>(e), opts.hw_accel ? 1 : 0, opts.mpeg4_container ? 1 : 0,
+			opts.h264_extended_attrs ? 1 : 0, opts.minimal_type ? 1 : 0, width, height, fps);
 		if (writer) writer->Release();
 		delete_file_if_exists(path);
 		return e;
@@ -727,18 +755,20 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 	hr = new_media_type(&out_v);
 	if (FAILED(hr)) return fail(hr);
 	out_v->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-	out_v->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+	out_v->SetGUID(MF_MT_SUBTYPE, video_subtype(opts.codec));
 	MFSetAttributeSize(out_v, MF_MT_FRAME_SIZE, width, height);
 	MFSetAttributeRatio(out_v, MF_MT_FRAME_RATE, fps, 1);
 	MFSetAttributeRatio(out_v, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 	out_v->SetUINT32(MF_MT_AVG_BITRATE, video_bitrate_bps());
 	out_v->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-	out_v->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
-	out_v->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
-	out_v->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
-	out_v->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
-	out_v->SetUINT32(MF_MT_MAX_KEYFRAME_SPACING, static_cast<UINT32>(fps > 0 ? fps * 5 : 75));
-	if (opts.h264_extended_attrs) {
+	if (!opts.minimal_type) {
+		out_v->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+		out_v->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+		out_v->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+		out_v->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+		out_v->SetUINT32(MF_MT_MAX_KEYFRAME_SPACING, static_cast<UINT32>(fps > 0 ? fps * 5 : 75));
+	}
+	if (!is_hevc_codec(opts.codec) && opts.h264_extended_attrs) {
 		out_v->SetUINT32(MF_MT_MPEG2_PROFILE, 77); // Main
 		out_v->SetUINT32(MF_MT_MPEG2_LEVEL, 51);
 		out_v->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
@@ -756,10 +786,12 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 		MFSetAttributeSize(in_v, MF_MT_FRAME_SIZE, width, height);
 		MFSetAttributeRatio(in_v, MF_MT_FRAME_RATE, fps, 1);
 		in_v->SetUINT32(MF_MT_DEFAULT_STRIDE, nv12 ? static_cast<UINT32>(width) : static_cast<UINT32>(width * 4));
-		in_v->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, nv12 ? MFNominalRange_16_235 : MFNominalRange_0_255);
-		in_v->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
-		in_v->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
-		in_v->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+		if (!opts.minimal_type) {
+			in_v->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, nv12 ? MFNominalRange_16_235 : MFNominalRange_0_255);
+			in_v->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+			in_v->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+			in_v->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+		}
 		const HRESULT input_hr = writer->SetInputMediaType(g_v_stream, in_v, nullptr);
 		in_v->Release();
 		return input_hr;
@@ -824,7 +856,7 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 		g_with_audio.store(true);
 	}
 
-	if (!apply_dynamic_bitrate(writer) && opts.hw_accel) {
+	if (!apply_dynamic_bitrate(writer) && opts.hw_accel && !is_hevc_codec(opts.codec)) {
 		tracef("rate control: hardware encoder rejected dynamic bitrate");
 		return fail(E_NOTIMPL);
 	}
@@ -855,13 +887,32 @@ static HRESULT create_writer(const wchar_t *path, int width, int height, int fps
 	g_h264_nv12 = false;
 	g_encode_audio_rate_hz = 0;
 
-	static const writer_create_opts attempts[] = {
-		{true, true, false},
-		{false, true, false},
-		{false, true, true},
-		{false, false, false},
+	const writer_create_opts hevc_attempts[] = {
+		{true, true, false, false, kCodecHEVC},
+		{true, true, false, true, kCodecHEVC},
+		{true, true, false, true, kCodecH265},
 	};
 	HRESULT hr = E_FAIL;
+	for (size_t i = 0; i < sizeof(hevc_attempts) / sizeof(hevc_attempts[0]); i++) {
+		const writer_create_opts &opts = hevc_attempts[i];
+		tracef("create_writer: hevc attempt %u hw=%d mpeg4=%d minimal=%d fourcc=%s",
+			static_cast<unsigned>(i + 1), opts.hw_accel ? 1 : 0, opts.mpeg4_container ? 1 : 0,
+			opts.minimal_type ? 1 : 0, opts.codec == kCodecH265 ? "H265" : "HEVC");
+		hr = create_h264_mp4_writer_internal(path, width, height, fps, with_audio, opts, out);
+		if (SUCCEEDED(hr)) {
+			crash_log_trace("create_writer: hevc ok");
+			return hr;
+		}
+		tracef("create_writer: hevc attempt %u failed hr=0x%08lX", static_cast<unsigned>(i + 1), static_cast<unsigned long>(hr));
+	}
+	crash_log_trace("create_writer: hevc unavailable, falling back to h264");
+
+	static const writer_create_opts attempts[] = {
+		{true, true, false, false, kCodecH264},
+		{false, true, false, false, kCodecH264},
+		{false, true, true, false, kCodecH264},
+		{false, false, false, false, kCodecH264},
+	};
 	for (size_t i = 0; i < sizeof(attempts) / sizeof(attempts[0]); i++) {
 		const writer_create_opts &opts = attempts[i];
 		tracef("create_writer: h264 attempt %u hw=%d mpeg4=%d ext=%d",
