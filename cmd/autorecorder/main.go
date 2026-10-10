@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -56,8 +57,16 @@ func main() {
 		os.Exit(0)
 	}
 
-	exePathEarly, _ := os.Executable()
-	logPath := applog.Init(filepath.Dir(exePathEarly))
+	exePathEarly, errExe := os.Executable()
+	if errExe != nil {
+		log.Printf("读取程序路径失败: %v", errExe)
+		exePathEarly = ""
+	}
+	logDir := filepath.Dir(exePathEarly)
+	if exePathEarly == "" {
+		logDir = "."
+	}
+	logPath := applog.Init(logDir)
 	defer applog.Close()
 	log.Printf("诊断日志: %s", logPath)
 
@@ -71,38 +80,41 @@ func main() {
 	if errors.Is(err, config.ErrFileMissing) {
 		log.Printf("配置文件不存在，使用默认值: %s", *cfgPath)
 	} else if err != nil {
-		log.Fatalf("load config: %v", err)
+		log.Printf("读取配置失败，改用默认配置: %v", err)
+		cfg = config.Default()
 	}
 	if err := cfg.Validate(); err != nil {
-		log.Fatalf("invalid config: %v", err)
+		log.Printf("配置无效，改用默认配置: %v", err)
+		cfg = config.Default()
 	}
 	if err := output.EnsureDir(cfg); err != nil {
-		log.Fatalf("output dir: %v", err)
+		log.Printf("创建保存目录失败，开录时会再试: %v", err)
 	}
 
-	exePath, err := os.Executable()
-	if err != nil {
-		log.Fatalf("executable path: %v", err)
-	}
+	exePath := exePathEarly
 	notify.Init(exePath)
 
 	rec := wincap.NewNativeRecorder()
 	ctrl := controller.New(rec, func(processName string, start time.Time) string {
 		return output.BuildSessionPath(cfg, processName, start)
 	}, cfg, func(finalPath string) {
-		path := finalPath
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					applog.LogPanic("RecordingSaved toast", r)
-				}
-			}()
-			log.Printf("toast: showing for %s", path)
-			if err := notify.RecordingSaved(exePath, path); err != nil {
-				log.Printf("notification: %v", err)
+		go safeCall("保存通知", func() {
+			log.Printf("通知: 录屏已保存 %s", finalPath)
+			if err := notify.RecordingSaved(exePath, finalPath); err != nil {
+				log.Printf("保存通知失败: %v", err)
 			}
-			log.Printf("toast: done for %s", path)
-		}()
+		})
+	})
+	ctrl.SetOnFailed(func(msg string) {
+		go safeCall("失败通知", func() {
+			log.Printf("通知: 录屏失败 %s", msg)
+			if err := notify.RecordingFailed(exePath, msg); err != nil {
+				log.Printf("失败通知发送失败: %v", err)
+			}
+		})
+	})
+	ctrl.SetReinit(func() error {
+		return wincap.Restart()
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -112,37 +124,110 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ctrl.Run(ctx)
+		for {
+			func() {
+				defer func() {
+					r := recover()
+					if r == nil {
+						return
+					}
+					applog.LogPanic("controller", r)
+					log.Printf("控制器异常，准备重新初始化: %v", r)
+					func() {
+						defer func() {
+							if r2 := recover(); r2 != nil {
+								applog.LogPanic("controller recover", r2)
+							}
+						}()
+						ctrl.Recover(fmt.Sprint(r))
+					}()
+				}()
+				ctrl.Run(ctx)
+			}()
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("控制器已退出，1 秒后重新运行")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
 	}()
-
-	if err := wincap.Start(
-		func(event int, pid uint32) { handleMic(ctrl, event, pid) },
-		func(from, to int, hmon uint64) {
-			ctrl.PostMonitor(controller.MonitorEvent{FromIndex: from, ToIndex: to, Handle: hmon})
-		},
-	); err != nil {
-		log.Fatalf("native start: %v", err)
-	}
-	defer wincap.Stop()
-
-	log.Printf("AutoScreenRecorder running (config: %s)", *cfgPath)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+
+	var lastNativeFail time.Time
+	for {
+		err := wincap.Start(
+			func(event int, pid uint32) { handleMic(ctrl, event, pid) },
+			func(from, to int, hmon uint64) {
+				ctrl.PostMonitor(controller.MonitorEvent{FromIndex: from, ToIndex: to, Handle: hmon})
+			},
+		)
+		if err == nil {
+			break
+		}
+		log.Printf("原生服务启动失败，5 秒后重试: %v", err)
+		wincap.NativeTrace("Go: native start failed: " + err.Error())
+		if time.Since(lastNativeFail) >= 30*time.Second {
+			lastNativeFail = time.Now()
+			msg := err.Error()
+			go safeCall("失败通知", func() {
+				if nerr := notify.RecordingFailed(exePath, msg); nerr != nil {
+					log.Printf("失败通知发送失败: %v", nerr)
+				}
+			})
+		}
+		select {
+		case <-sig:
+			cancel()
+			wg.Wait()
+			log.Println("shutting down")
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+	defer func() {
+		safeCall("native stop", wincap.Stop)
+	}()
+
+	log.Printf("AutoScreenRecorder running (config: %s)", *cfgPath)
 	<-sig
 	cancel()
 	wg.Wait()
 	log.Println("shutting down")
 }
 
+func safeCall(where string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			applog.LogPanic(where, r)
+		}
+	}()
+	fn()
+}
+
 func handleMic(ctrl *controller.Controller, event int, pid uint32) {
+	defer func() {
+		if r := recover(); r != nil {
+			applog.LogPanic("handleMic", r)
+		}
+	}()
 	cfg := ctrl.Config()
 	switch event {
 	case 1:
 		ok, exe, err := process.MatchesAnyWatch(pid, cfg.MicTrigger.Watch)
-		if err != nil || !ok {
+		if err != nil {
+			log.Printf("查询占用麦克风的进程失败 pid=%d err=%v", pid, err)
 			return
 		}
+		if !ok {
+			return
+		}
+		log.Printf("名单内程序占用麦克风 pid=%d exe=%s", pid, exe)
 		ctrl.PostMic(controller.MicEvent{Type: controller.MicActive, PID: pid, Exe: exe})
 	case 2:
 		ctrl.PostMic(controller.MicEvent{Type: controller.MicReleased, PID: pid})

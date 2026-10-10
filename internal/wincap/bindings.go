@@ -67,7 +67,15 @@ func autoScreenMonitorCB(from, to C.int, hmon C.ulonglong) {
 	}
 }
 
+var nativeLife sync.Mutex
+
 func Start(onMic func(event int, pid uint32), onMonitor func(from, to int, hmon uint64)) error {
+	nativeLife.Lock()
+	defer nativeLife.Unlock()
+	return startLocked(onMic, onMonitor)
+}
+
+func startLocked(onMic func(event int, pid uint32), onMonitor func(from, to int, hmon uint64)) error {
 	defaultPlatform.mu.Lock()
 	defaultPlatform.onMic = onMic
 	defaultPlatform.onMonitor = onMonitor
@@ -78,13 +86,38 @@ func Start(onMic func(event int, pid uint32), onMonitor func(from, to int, hmon 
 		(C.native_monitor_cb)(C.autoScreenMonitorCB),
 	)
 	if r != 0 {
-		return errors.New("native_start failed")
+		return fmt.Errorf("原生服务启动失败，代码 %d", int(r))
 	}
+	log.Printf("原生服务已启动")
+	NativeTrace("Go: native service started")
 	return nil
 }
 
 func Stop() {
+	nativeLife.Lock()
+	defer nativeLife.Unlock()
+	log.Printf("原生服务停止")
+	NativeTrace("Go: native service stop")
 	C.native_stop()
+}
+
+// Restart tears down capture and microphone watching, then starts them again.
+func Restart() error {
+	nativeLife.Lock()
+	defer nativeLife.Unlock()
+	log.Printf("重新初始化原生服务")
+	NativeTrace("Go: native restart begin")
+	C.native_stop()
+	defaultPlatform.mu.Lock()
+	onMic := defaultPlatform.onMic
+	onMon := defaultPlatform.onMonitor
+	defaultPlatform.mu.Unlock()
+	if err := startLocked(onMic, onMon); err != nil {
+		NativeTrace("Go: native restart failed: " + err.Error())
+		return err
+	}
+	NativeTrace("Go: native restart ok")
+	return nil
 }
 
 func CurrentMonitor() uint64 {
@@ -114,33 +147,44 @@ func (n *NativeRecorder) Start(_ context.Context, path string, monitorHandle uin
 	if mon == 0 {
 		mon = CurrentMonitor()
 	}
+	log.Printf("开始录制 path=%s monitor=%d fps=%d bitrate=%dkbps container=%s audio=%t",
+		path, mon, cfg.Record.FPS, cfg.Record.VideoBitrateKbps, cfg.Record.Container, cfg.Audio.Enabled)
+	NativeTrace(fmt.Sprintf("Go: start path=%s monitor=%d fps=%d bitrate=%d container=%s",
+		path, mon, cfg.Record.FPS, cfg.Record.VideoBitrateKbps, cfg.Record.Container))
 	r := C.native_start_recording(cpath, C.ulonglong(mon), &nc)
 	runtime.KeepAlive(pathBuf)
-	if r == -4 || r == -5 {
-		hr := uint32(int32(C.native_last_mf_hresult()))
-		var ew, eh C.int
-		C.native_last_encode_size(&ew, &eh)
-		if r == -5 {
-			return fmt.Errorf("screen capture failed at %dx%d", int(ew), int(eh))
-		}
-		if hr == 0 {
-			return fmt.Errorf("video encoder failed to start at %dx%d (check Media Foundation / WMV or H.264 encoder)", int(ew), int(eh))
-		}
-		return fmt.Errorf("video encoder failed to start at %dx%d (MF HRESULT=0x%08X; WMV 需 Windows Media 组件；MP4 需 H.264 编码器)", int(ew), int(eh), hr)
-	}
-	if r == -7 {
-		return errors.New("previous recording is still stopping")
-	}
-	if r == -8 {
-		return errors.New("previous recording session has not finished")
-	}
 	if r != 0 {
-		return errors.New("native_start_recording failed")
+		msg := startErr(r)
+		log.Printf("开始录制失败 code=%d %s", int(r), msg)
+		NativeTrace(fmt.Sprintf("Go: start failed code=%d %s", int(r), msg))
+		return msg
 	}
 	n.mu.Lock()
 	n.sessionPath = path
 	n.mu.Unlock()
 	return nil
+}
+
+func startErr(r C.int) error {
+	if r == -4 || r == -5 {
+		hr := uint32(int32(C.native_last_mf_hresult()))
+		var ew, eh C.int
+		C.native_last_encode_size(&ew, &eh)
+		if r == -5 {
+			return fmt.Errorf("抓屏失败，分辨率 %dx%d", int(ew), int(eh))
+		}
+		if hr == 0 {
+			return fmt.Errorf("视频编码器启动失败，分辨率 %dx%d", int(ew), int(eh))
+		}
+		return fmt.Errorf("视频编码器启动失败，分辨率 %dx%d，错误码 0x%08X", int(ew), int(eh), hr)
+	}
+	if r == -7 {
+		return errors.New("上一段录音线程还没结束")
+	}
+	if r == -8 {
+		return errors.New("上一段录制还没结束")
+	}
+	return fmt.Errorf("无法开始录制，代码 %d", int(r))
 }
 
 func (n *NativeRecorder) SetMonitor(monitorHandle uint64) error {
@@ -178,19 +222,21 @@ func (n *NativeRecorder) Stop(_ context.Context) (string, error) {
 
 	if _, err := os.Stat(session); err != nil {
 		if pending {
-			return "", fmt.Errorf("recording is still finalizing")
+			return "", fmt.Errorf("视频还在保存")
 		}
 		if _, errTemp := os.Stat(tempPath); errTemp == nil {
 			if errRename := os.Rename(tempPath, session); errRename == nil {
-				log.Printf("recording recovered from temp file: %s", session)
+				log.Printf("从临时文件恢复录制: %s", session)
 				return session, nil
+			} else {
+				log.Printf("临时文件改名失败: %v", errRename)
 			}
 		}
 		if frames <= 0 {
 			_ = os.Remove(tempPath)
-			return "", fmt.Errorf("recording failed: no video frames encoded")
+			return "", fmt.Errorf("没有录到画面，文件未保存")
 		}
-		return "", fmt.Errorf("recording output missing (encoded %d frames)", frames)
+		return "", fmt.Errorf("视频文件丢失，已编码 %d 帧", frames)
 	}
 	return session, nil
 }

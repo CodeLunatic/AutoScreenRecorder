@@ -416,3 +416,26 @@ func RecordingSaved(exePath, videoPath string) error {
 	defer pushMu.Unlock()
 	return n.Push()
 }
+
+// RecordingFailed tells the user a recording did not start or was not saved.
+func RecordingFailed(exePath, detail string) error {
+	setup(exePath)
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		detail = "请查看 AutoScreenRecorder.log"
+	}
+	rs := []rune(detail)
+	if len(rs) > 180 {
+		detail = string(rs[:180])
+	}
+	n := toast.Notification{
+		AppID:   appID,
+		Title:   cdataText("录屏失败"),
+		Message: cdataText(detail),
+		Icon:    xmlAttr(toastIcon),
+		Audio:   toast.Default,
+	}
+	pushMu.Lock()
+	defer pushMu.Unlock()
+	return n.Push()
+}

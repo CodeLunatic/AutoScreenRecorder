@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +50,12 @@ type Controller struct {
 	recorder Recorder
 	pathGen  func(process string, start time.Time) string
 	onSaved  func(finalPath string)
+	onFailed func(string)
+	reinit   func() error
+
+	failStreak  int
+	lastFailMsg string
+	lastFailAt  time.Time
 
 	events chan any
 
@@ -88,6 +95,19 @@ func New(rec Recorder, pathGen func(process string, start time.Time) string, cfg
 		mics:      make(map[uint32]*micUse),
 		activeMic: make(map[uint32]string),
 	}
+}
+
+func (c *Controller) SetOnFailed(fn func(string)) {
+	c.onFailed = fn
+}
+
+func (c *Controller) SetReinit(fn func() error) {
+	c.reinit = fn
+}
+
+// Recover 在控制器崩溃后清掉会话状态，并重新拉起采集。
+func (c *Controller) Recover(reason string) {
+	c.reinitialize(reason)
 }
 
 func (c *Controller) UpdateConfig(cfg config.Config) {
@@ -368,17 +388,82 @@ func (c *Controller) handleStartNow(e startNow) {
 	mon := c.recorder.CurrentMonitorHandle()
 	path := c.pathGen(c.lastProcess, c.sessionStart)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		log.Printf("创建保存目录失败: %v", err)
-		c.retryStartWhileMicHeld()
+		log.Printf("创建保存目录失败 path=%s err=%v", path, err)
+		c.noteFailure(fmtErr("创建保存目录失败: %v", err))
 		return
 	}
+	log.Printf("准备开录 process=%s path=%s monitor=%d", c.lastProcess, path, mon)
 	if err := c.recorder.Start(context.Background(), path, mon, cfg); err != nil {
-		log.Printf("start recording: %v", err)
+		log.Printf("开录失败 process=%s path=%s err=%v", c.lastProcess, path, err)
+		c.noteFailure(err)
+		return
+	}
+	c.failStreak = 0
+	c.lastFailMsg = ""
+	c.recording = true
+	log.Printf("录制已开始: %s", path)
+}
+
+func fmtErr(format string, err error) error {
+	return &wrappedErr{s: sprintf(format, err)}
+}
+
+func sprintf(format string, err error) string {
+	return strings.ReplaceAll(format, "%v", err.Error())
+}
+
+type wrappedErr struct{ s string }
+
+func (e *wrappedErr) Error() string { return e.s }
+
+func (c *Controller) noteFailure(err error) {
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+	log.Printf("录制失败: %s", msg)
+	c.reportFailure(msg)
+	c.failStreak++
+	stuck := strings.Contains(msg, "还没结束")
+	if stuck || c.failStreak >= 3 {
+		c.reinitialize(msg)
+		c.failStreak = 0
+		return
+	}
+	c.retryStartWhileMicHeld()
+}
+
+func (c *Controller) reportFailure(msg string) {
+	now := time.Now()
+	if msg == c.lastFailMsg && now.Sub(c.lastFailAt) < 30*time.Second {
+		log.Printf("相同失败 30 秒内不再重复通知")
+		return
+	}
+	c.lastFailMsg = msg
+	c.lastFailAt = now
+	if c.onFailed != nil {
+		c.onFailed(msg)
+	}
+}
+
+func (c *Controller) reinitialize(reason string) {
+	log.Printf("重新初始化: %s", reason)
+	c.recording = false
+	c.invalidateStart()
+	c.invalidateStop()
+	c.micMu.Lock()
+	c.mics = make(map[uint32]*micUse)
+	c.dirty = false
+	c.micMu.Unlock()
+	c.activeMic = make(map[uint32]string)
+	if c.reinit == nil {
 		c.retryStartWhileMicHeld()
 		return
 	}
-	c.recording = true
-	log.Printf("recording started: %s", path)
+	if err := c.reinit(); err != nil {
+		log.Printf("重新初始化失败: %v", err)
+		c.reportFailure("重新初始化失败: " + err.Error())
+	}
 }
 
 func (c *Controller) retryStartWhileMicHeld() {
@@ -412,7 +497,8 @@ func (c *Controller) stopRecording(ctx context.Context) {
 	finalPath, err := c.recorder.Stop(ctx)
 	c.recording = false
 	if err != nil {
-		log.Printf("stop recording: %v", err)
+		log.Printf("停止录制失败: %v", err)
+		c.reportFailure("停止录制失败: " + err.Error())
 		return
 	}
 	if finalPath != "" {

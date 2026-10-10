@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <condition_variable>
 #include <deque>
@@ -34,6 +36,24 @@ static bool guid_equal(const GUID &a, const GUID &b) {
 	return memcmp(&a, &b, sizeof(GUID)) == 0;
 }
 
+static void tracef(const char *fmt, ...) {
+	char buf[768];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	crash_log_trace(buf);
+}
+
+static void trace_wpath(const char *prefix, const wchar_t *path) {
+	char narrow[480];
+	narrow[0] = 0;
+	if (path) {
+		WideCharToMultiByte(CP_UTF8, 0, path, -1, narrow, static_cast<int>(sizeof(narrow) - 1), nullptr, nullptr);
+	}
+	tracef("%s %s", prefix, narrow);
+}
+
 static bool is_pcm_format(const WAVEFORMATEX *wfx) {
 	if (!wfx) return false;
 	if (wfx->wFormatTag == WAVE_FORMAT_PCM) return true;
@@ -47,6 +67,7 @@ static bool is_pcm_format(const WAVEFORMATEX *wfx) {
 static std::atomic<bool> g_rec_active{false};
 static std::thread g_video_thread;
 static std::thread g_audio_thread;
+static std::atomic<bool> g_audio_join_abandoned{false};
 static std::mutex g_rec_mu;
 struct PendingAudio {
 	std::vector<int16_t> pcm;
@@ -432,11 +453,13 @@ static HRESULT create_wmv_once(const wchar_t *path, int width, int height, int f
 	if (attrs) attrs->Release();
 	if (FAILED(hr)) {
 		g_last_mf_hr.store(hr);
+		tracef("wmv sink writer failed hr=0x%08lX", static_cast<unsigned long>(hr));
 		return hr;
 	}
 
 	auto fail = [&](HRESULT e) -> HRESULT {
 		g_last_mf_hr.store(e);
+		tracef("wmv writer failed hr=0x%08lX", static_cast<unsigned long>(e));
 		if (writer) writer->Release();
 		delete_file_if_exists(path);
 		return e;
@@ -563,11 +586,15 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 	if (attrs) attrs->Release();
 	if (FAILED(hr)) {
 		g_last_mf_hr.store(hr);
+		tracef("h264 sink writer failed hr=0x%08lX hw=%d %dx%d", static_cast<unsigned long>(hr), opts.hw_accel ? 1 : 0, width, height);
 		return hr;
 	}
 
 	auto fail = [&](HRESULT e) -> HRESULT {
 		g_last_mf_hr.store(e);
+		tracef("h264 writer failed hr=0x%08lX hw=%d mpeg4=%d ext=%d %dx%d fps=%d",
+			static_cast<unsigned long>(e), opts.hw_accel ? 1 : 0, opts.mpeg4_container ? 1 : 0,
+			opts.h264_extended_attrs ? 1 : 0, width, height, fps);
 		if (writer) writer->Release();
 		delete_file_if_exists(path);
 		return e;
@@ -670,12 +697,19 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 }
 
 static HRESULT create_writer(const wchar_t *path, int width, int height, int fps, bool with_audio, IMFSinkWriter **out) {
+	tracef("create_writer: %dx%d fps=%d audio=%d wmv=%d bitrate_kbps=%d",
+		width, height, fps, with_audio ? 1 : 0, g_cfg.use_wmv ? 1 : 0, g_cfg.video_bitrate_kbps);
+	trace_wpath("create_writer path:", path);
 	if (g_cfg.use_wmv) {
 		g_wmv_input_iyuv = false;
 		g_h264_nv12 = false;
 		g_encode_audio_rate_hz = 0;
 		HRESULT hr = create_wmv_writer(path, width, height, fps, with_audio, out);
-		if (SUCCEEDED(hr)) return hr;
+		if (SUCCEEDED(hr)) {
+			crash_log_trace("create_writer: wmv ok");
+			return hr;
+		}
+		tracef("create_writer: wmv failed hr=0x%08lX", static_cast<unsigned long>(hr));
 		return hr;
 	}
 	g_wmv_input_iyuv = false;
@@ -689,12 +723,24 @@ static HRESULT create_writer(const wchar_t *path, int width, int height, int fps
 		{false, false, false},
 	};
 	HRESULT hr = E_FAIL;
-	for (const writer_create_opts &opts : attempts) {
+	for (size_t i = 0; i < sizeof(attempts) / sizeof(attempts[0]); i++) {
+		const writer_create_opts &opts = attempts[i];
+		tracef("create_writer: h264 attempt %u hw=%d mpeg4=%d ext=%d",
+			static_cast<unsigned>(i + 1), opts.hw_accel ? 1 : 0, opts.mpeg4_container ? 1 : 0, opts.h264_extended_attrs ? 1 : 0);
 		hr = create_h264_mp4_writer_internal(path, width, height, fps, with_audio, opts, out);
-		if (SUCCEEDED(hr)) return hr;
+		if (SUCCEEDED(hr)) {
+			crash_log_trace("create_writer: h264 ok");
+			return hr;
+		}
+		tracef("create_writer: h264 attempt %u failed hr=0x%08lX", static_cast<unsigned>(i + 1), static_cast<unsigned long>(hr));
 	}
+	crash_log_trace("create_writer: h264 retry without audio");
 	hr = create_h264_mp4_writer_internal(path, width, height, fps, false, attempts[3], out);
-	if (SUCCEEDED(hr)) return hr;
+	if (SUCCEEDED(hr)) {
+		crash_log_trace("create_writer: h264 ok without audio");
+		return hr;
+	}
+	tracef("create_writer: all attempts failed hr=0x%08lX", static_cast<unsigned long>(hr));
 	return hr;
 }
 
@@ -1021,6 +1067,7 @@ static void run_video_session(void) {
 	g_last_enc_h.store(enc_h);
 	if (!g_rec_active.load()) return;
 	if (!capture_frame(&pixels, fixed_w, fixed_h)) {
+		tracef("capture_frame: failed canvas=%dx%d", fixed_w, fixed_h);
 		g_fail_code.store(-5);
 		g_rec_active.store(false);
 		return;
@@ -1034,6 +1081,7 @@ static void run_video_session(void) {
 	IMFSinkWriter *writer = nullptr;
 	const HRESULT cw = create_writer(g_write_path.c_str(), enc_w, enc_h, fps, with_audio, &writer);
 	if (FAILED(cw) || !writer) {
+		tracef("run_video_session: create_writer failed hr=0x%08lX encode=%dx%d", static_cast<unsigned long>(cw), enc_w, enc_h);
 		g_last_mf_hr.store(cw);
 		g_fail_code.store(-4);
 		g_rec_active.store(false);
@@ -1162,17 +1210,36 @@ static bool wait_session_done(void) {
 }
 
 static bool join_audio_thread(void) {
-	if (!g_audio_thread.joinable()) return true;
-	crash_log_trace("join_audio_thread: begin");
-	HANDLE h = reinterpret_cast<HANDLE>(g_audio_thread.native_handle());
-	const DWORD wr = WaitForSingleObject(h, 15000);
-	if (wr == WAIT_TIMEOUT) {
-		crash_log_trace("join_audio_thread: timeout");
+	if (g_audio_join_abandoned.load()) {
+		crash_log_trace("join_audio_thread: previous join still running");
 		return false;
 	}
-	g_audio_thread.join();
-	crash_log_trace("join_audio_thread: returned");
-	return true;
+	if (!g_audio_thread.joinable()) return true;
+	crash_log_trace("join_audio_thread: begin");
+	HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (!done) {
+		tracef("join_audio_thread: create event failed err=%lu", GetLastError());
+		g_audio_thread.join();
+		crash_log_trace("join_audio_thread: returned");
+		return true;
+	}
+	std::thread helper([done] {
+		g_audio_thread.join();
+		g_audio_join_abandoned.store(false);
+		SetEvent(done);
+	});
+	const DWORD wr = WaitForSingleObject(done, 15000);
+	tracef("join_audio_thread: wait=%lu", static_cast<unsigned long>(wr));
+	if (wr == WAIT_OBJECT_0) {
+		helper.join();
+		CloseHandle(done);
+		crash_log_trace("join_audio_thread: returned");
+		return true;
+	}
+	g_audio_join_abandoned.store(true);
+	helper.detach();
+	crash_log_trace("join_audio_thread: timeout, abandoned");
+	return false;
 }
 
 static void ensure_encoder_thread(void) {
@@ -2048,6 +2115,12 @@ int recorder_start(const wchar_t *path, uint64_t hmon, const native_rec_config *
 	g_hmon.store(hmon ? hmon : monitor_tracker_current());
 	g_final_path = path;
 	g_write_path = temp_recording_path(g_final_path);
+	tracef("recorder_start: fps=%d wmv=%d bitrate_kbps=%d audio=%d follow=%d hmon=%llu",
+		g_cfg.fps, g_cfg.use_wmv ? 1 : 0, g_cfg.video_bitrate_kbps,
+		(g_cfg.audio_enabled && (g_cfg.system_enabled || g_cfg.mic_enabled)) ? 1 : 0,
+		g_cfg.follow_mouse ? 1 : 0, static_cast<unsigned long long>(g_hmon.load()));
+	trace_wpath("recorder_start final:", g_final_path.c_str());
+	trace_wpath("recorder_start temp:", g_write_path.c_str());
 	ensure_parent_dir(g_final_path);
 	delete_file_if_exists(g_write_path.c_str());
 	g_video_frames.store(0);
@@ -2066,7 +2139,14 @@ int recorder_start(const wchar_t *path, uint64_t hmon, const native_rec_config *
 	}
 	g_sess_cv.notify_all();
 	if (g_cfg.audio_enabled && (g_cfg.system_enabled || g_cfg.mic_enabled)) {
-		if (g_audio_thread.joinable()) g_audio_thread.join();
+		if (g_audio_join_abandoned.load() || !join_audio_thread()) {
+			crash_log_trace("recorder_start: cannot start audio thread");
+			g_rec_active.store(false);
+			g_sess_cv.notify_all();
+			wait_session_done();
+			end_hires_timer();
+			return -7;
+		}
 		g_audio_thread = std::thread(audio_loop);
 	}
 	for (int i = 0; i < 2000; i++) {
@@ -2087,7 +2167,7 @@ int recorder_start(const wchar_t *path, uint64_t hmon, const native_rec_config *
 	end_hires_timer();
 	const int code = g_fail_code.load();
 	if (!g_output_committed.load()) delete_file_if_exists(g_write_path.c_str());
-	crash_log_trace("recorder_start: failed");
+	tracef("recorder_start: failed code=%d hr=0x%08lX", code, static_cast<unsigned long>(g_last_mf_hr.load()));
 	return code != 0 ? code : -4;
 }
 
@@ -2145,9 +2225,11 @@ void recorder_shutdown(void) {
 	g_rec_active.store(false);
 	g_sess_cv.notify_all();
 	wait_session_done();
-	if (!join_audio_thread() && g_audio_thread.joinable()) {
-		crash_log_trace("recorder_shutdown: detach stuck audio thread");
-		g_audio_thread.detach();
+	if (g_audio_join_abandoned.load()) {
+		crash_log_trace("recorder_shutdown: audio join already abandoned");
+	} else if (!join_audio_thread() && g_audio_thread.joinable()) {
+		crash_log_trace("recorder_shutdown: audio join abandoned, helper still joining");
+		g_audio_join_abandoned.store(true);
 	}
 	if (!fin_wait_for(std::chrono::seconds(5))) {
 		crash_log_trace("recorder_shutdown: finalize still running");
