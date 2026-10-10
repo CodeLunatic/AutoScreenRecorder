@@ -8,7 +8,7 @@
 #   Copy-Item config.example.faststone.yaml config.yaml
 #   Copy-Item config.example.high-quality.yaml config.yaml
 #
-# 音频编码不随配置变化：始终 48 kHz 立体声、320 kbps（MP4 为 AAC，WMV 为 WMA）。
+# 音频编码不随配置变化：始终 48 kHz 立体声。MP4 的 AAC 为动态码率，平均 320 kbps，安静时更低；编码器不接受时退回固定 320 kbps。WMV 的 WMA 仍是固定 320 kbps。
 #
 # 配置项说明（各示例文件里也有同样注释）：
 #
@@ -18,7 +18,7 @@
 # record.follow_mouse          true：画面跟随鼠标所在显示器。false：固定在开录时的那块屏。
 #                              跟随时，成片分辨率是面积最大的那块屏。较小的屏等比例缩放后居中，黑边只在上下或左右。
 # record.fps                   帧率，整数 1–60。
-# record.video_bitrate_kbps    视频码率，单位 kbps。0 表示 400。这个值原样送给编码器，不会因分辨率再被抬高。
+# record.video_bitrate_kbps    视频平均码率，单位 kbps。0 表示 400。动态码率：画面静止时更低，变化大时最高到两倍。不会因分辨率再被抬高。
 # record.encode_max_width      编码最大宽度（像素）。0 表示这一维不限制。
 # record.encode_max_height     编码最大高度（像素）。0 表示这一维不限制。两边都为 0 时不缩小。
 # record.container             容器。mp4 或 h264：MP4/H.264。wmv 或其他值：WMV。

@@ -167,6 +167,14 @@ static int audio_bitrate_bytes_per_sec(void) {
 	return 320 * 1000 / 8;
 }
 
+static UINT32 audio_bitrate_bps(void) {
+	return 320 * 1000U;
+}
+
+// Windows AAC 动态码率开关。必须写在输出类型上，编码器收到类型之前才会生效。
+static const GUID kCodecApiAACEnableVBR = {
+	0xe836bb98, 0xfca3, 0x44b6, {0x9a, 0x39, 0x24, 0x78, 0x6b, 0xe4, 0x1b, 0xe1}};
+
 static int effective_audio_sample_rate_hz(void) {
 	if (g_encode_audio_rate_hz > 0) return g_encode_audio_rate_hz;
 	return audio_sample_rate_hz();
@@ -175,6 +183,120 @@ static int effective_audio_sample_rate_hz(void) {
 static UINT32 video_bitrate_bps(void) {
 	const int kbps = g_cfg.video_bitrate_kbps > 0 ? g_cfg.video_bitrate_kbps : 400;
 	return static_cast<UINT32>(kbps) * 1000U;
+}
+
+static UINT32 video_peak_bitrate_bps(void) {
+	const UINT64 peak = static_cast<UINT64>(video_bitrate_bps()) * 2;
+	if (peak > 0xFFFFFFFFu) return 0xFFFFFFFFu;
+	return static_cast<UINT32>(peak);
+}
+
+// MinGW 没有 codecapi.h，按 Windows 的 ICodecAPI 虚表声明编码器接口。
+static const GUID kIID_CodecAPI = {
+	0x901db4c7, 0x31ce, 0x41a2, {0x85, 0xdc, 0x8f, 0xa0, 0xbf, 0x41, 0xb8, 0xda}};
+static const GUID kCodecApiRateControlMode = {
+	0x1c0608e9, 0x370c, 0x4710, {0x8a, 0x58, 0xcb, 0x61, 0x81, 0xc4, 0x24, 0x23}};
+static const GUID kCodecApiMeanBitRate = {
+	0xf7222374, 0x2144, 0x4815, {0xb5, 0x50, 0xa3, 0x7f, 0x8e, 0x12, 0xee, 0x52}};
+static const GUID kCodecApiMaxBitRate = {
+	0x9651eae4, 0x39b9, 0x4ebf, {0x85, 0xef, 0xd7, 0xf4, 0x44, 0xec, 0x74, 0x65}};
+
+enum { kRateControlPeakVBR = 1 };
+
+struct CodecAPI : public IUnknown {
+	virtual HRESULT STDMETHODCALLTYPE IsSupported(const GUID *api) = 0;
+	virtual HRESULT STDMETHODCALLTYPE IsModifiable(const GUID *api) = 0;
+	virtual HRESULT STDMETHODCALLTYPE GetParameterRange(const GUID *api, VARIANT *valueMin, VARIANT *valueMax, VARIANT *steppingDelta) = 0;
+	virtual HRESULT STDMETHODCALLTYPE GetParameterValues(const GUID *api, VARIANT **values, ULONG *valuesCount) = 0;
+	virtual HRESULT STDMETHODCALLTYPE GetDefaultValue(const GUID *api, VARIANT *value) = 0;
+	virtual HRESULT STDMETHODCALLTYPE GetValue(const GUID *api, VARIANT *value) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SetValue(const GUID *api, VARIANT *value) = 0;
+	virtual HRESULT STDMETHODCALLTYPE RegisterForEvent(const GUID *api, LONG_PTR userData) = 0;
+	virtual HRESULT STDMETHODCALLTYPE UnregisterForEvent(const GUID *api) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SetAllDefaults(void) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SetValueWithNotify(const GUID *api, VARIANT *value, GUID **changedParam, ULONG *changedParamCount) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SetAllDefaultsWithNotify(GUID **changedParam, ULONG *changedParamCount) = 0;
+	virtual HRESULT STDMETHODCALLTYPE GetAllSettings(IStream *stream) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SetAllSettings(IStream *stream) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SetAllSettingsWithNotify(IStream *stream, GUID **changedParam, ULONG *changedParamCount) = 0;
+};
+
+static bool variant_is_peak_vbr(const VARIANT &value) {
+	if (value.vt == VT_UI4) return value.ulVal == kRateControlPeakVBR;
+	if (value.vt == VT_I4) return value.lVal == kRateControlPeakVBR;
+	return false;
+}
+
+// 峰值受限的动态码率：平均为目标码率，静止画面可以更低，变化大时最高到两倍。
+static bool apply_dynamic_bitrate(IMFSinkWriter *writer) {
+	if (!writer) return false;
+	const UINT32 mean = video_bitrate_bps();
+	const UINT32 peak = video_peak_bitrate_bps();
+	CodecAPI *codec = nullptr;
+	HRESULT hr = writer->GetServiceForStream(g_v_stream, GUID_NULL, kIID_CodecAPI, reinterpret_cast<void **>(&codec));
+	if (FAILED(hr) || !codec) {
+		tracef("rate control: encoder interface missing hr=0x%08lX", static_cast<unsigned long>(hr));
+		return false;
+	}
+	VARIANT var;
+	VariantInit(&var);
+	var.vt = VT_UI4;
+	var.ulVal = kRateControlPeakVBR;
+	hr = codec->SetValue(&kCodecApiRateControlMode, &var);
+	if (SUCCEEDED(hr)) {
+		var.ulVal = mean;
+		hr = codec->SetValue(&kCodecApiMeanBitRate, &var);
+	}
+	if (SUCCEEDED(hr)) {
+		var.ulVal = peak;
+		hr = codec->SetValue(&kCodecApiMaxBitRate, &var);
+	}
+	bool confirmed = false;
+	if (SUCCEEDED(hr)) {
+		VARIANT got;
+		VariantInit(&got);
+		const HRESULT read = codec->GetValue(&kCodecApiRateControlMode, &got);
+		confirmed = FAILED(read) || variant_is_peak_vbr(got);
+		VariantClear(&got);
+	}
+	codec->Release();
+	tracef("rate control: peak vbr mean_bps=%u max_bps=%u ok=%d hr=0x%08lX",
+		mean, peak, confirmed ? 1 : 0, static_cast<unsigned long>(hr));
+	return confirmed;
+}
+
+// 向 AAC 编码器读回动态码率开关。创建音轨成功不等于编码器真的打开了它。
+static void trace_aac_vbr_readback(IMFSinkWriter *writer) {
+	if (!writer) return;
+	CodecAPI *codec = nullptr;
+	const HRESULT hr = writer->GetServiceForStream(g_a_stream, GUID_NULL, kIID_CodecAPI, reinterpret_cast<void **>(&codec));
+	if (FAILED(hr) || !codec) {
+		tracef("aac: readback interface missing hr=0x%08lX", static_cast<unsigned long>(hr));
+		return;
+	}
+	const HRESULT supported = codec->IsSupported(&kCodecApiAACEnableVBR);
+	VARIANT got;
+	VariantInit(&got);
+	const HRESULT read = codec->GetValue(&kCodecApiAACEnableVBR, &got);
+	int enabled = -1;
+	long raw = 0;
+	if (SUCCEEDED(read)) {
+		if (got.vt == VT_BOOL) {
+			raw = got.boolVal;
+			enabled = got.boolVal != VARIANT_FALSE ? 1 : 0;
+		} else if (got.vt == VT_UI4) {
+			raw = static_cast<long>(got.ulVal);
+			enabled = got.ulVal != 0 ? 1 : 0;
+		} else if (got.vt == VT_I4) {
+			raw = got.lVal;
+			enabled = got.lVal != 0 ? 1 : 0;
+		}
+	}
+	tracef("aac: readback vbr=%d vt=%u raw=%ld supported=0x%08lX get=0x%08lX",
+		enabled, static_cast<unsigned>(got.vt), raw,
+		static_cast<unsigned long>(supported), static_cast<unsigned long>(read));
+	VariantClear(&got);
+	codec->Release();
 }
 
 static void rgb32_to_iyuv(const BYTE *rgb, int width, int height, int rgb_stride, std::vector<BYTE> *iyuv) {
@@ -532,6 +654,7 @@ static HRESULT create_wmv_once(const wchar_t *path, int width, int height, int f
 		g_with_audio.store(true);
 	}
 
+	apply_dynamic_bitrate(writer);
 	hr = writer->BeginWriting();
 	if (FAILED(hr)) return fail(hr);
 	g_last_mf_hr.store(S_OK);
@@ -648,19 +771,30 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 
 	g_with_audio.store(false);
 	if (with_audio) {
-		IMFMediaType *out_a = nullptr;
-		hr = new_media_type(&out_a);
-		if (FAILED(hr)) return fail(hr);
-		out_a->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-		out_a->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-		out_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
-		out_a->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, static_cast<UINT32>(audio_sample_rate_hz()));
-		out_a->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-		{
+		auto add_aac = [&](bool vbr) -> HRESULT {
+			IMFMediaType *out_a = nullptr;
+			const HRESULT created = new_media_type(&out_a);
+			if (FAILED(created)) return created;
+			out_a->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+			out_a->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+			out_a->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+			out_a->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, static_cast<UINT32>(audio_sample_rate_hz()));
+			out_a->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
 			out_a->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, static_cast<UINT32>(audio_bitrate_bytes_per_sec()));
+			out_a->SetUINT32(MF_MT_AVG_BITRATE, audio_bitrate_bps());
+			if (vbr) out_a->SetUINT32(kCodecApiAACEnableVBR, TRUE);
+			const HRESULT added = writer->AddStream(out_a, &g_a_stream);
+			out_a->Release();
+			if (SUCCEEDED(added)) {
+				tracef("aac: requested %s average_bps=%u", vbr ? "vbr" : "cbr", audio_bitrate_bps());
+			}
+			return added;
+		};
+		hr = add_aac(true);
+		if (FAILED(hr)) {
+			tracef("aac: vbr rejected hr=0x%08lX, retry cbr", static_cast<unsigned long>(hr));
+			hr = add_aac(false);
 		}
-		hr = writer->AddStream(out_a, &g_a_stream);
-		out_a->Release();
 		if (FAILED(hr)) {
 			writer->Release();
 			delete_file_if_exists(path);
@@ -686,9 +820,14 @@ static HRESULT create_h264_mp4_writer_internal(const wchar_t *path, int width, i
 			delete_file_if_exists(path);
 			return create_h264_mp4_writer_internal(path, width, height, fps, false, opts, out);
 		}
+		trace_aac_vbr_readback(writer);
 		g_with_audio.store(true);
 	}
 
+	if (!apply_dynamic_bitrate(writer) && opts.hw_accel) {
+		tracef("rate control: hardware encoder rejected dynamic bitrate");
+		return fail(E_NOTIMPL);
+	}
 	hr = writer->BeginWriting();
 	if (FAILED(hr)) return fail(hr);
 	g_last_mf_hr.store(S_OK);

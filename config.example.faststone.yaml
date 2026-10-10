@@ -1,6 +1,6 @@
 # 模拟 FastStone 录屏：WMV/WMA、小体积、15fps、约 400kbps 视频
 # 使用：Copy-Item config.example.faststone.yaml config.yaml
-# 音频编码固定为 48 kHz 立体声、320 kbps，不在此配置。
+# 音频：48 kHz 立体声。MP4 的 AAC 为动态码率，平均 320 kbps；WMV 的 WMA 仍是固定 320 kbps。不在此配置。
 
 mic_trigger:
   # 占麦后开始录屏的进程。name：进程名，不区分大小写。
@@ -19,7 +19,7 @@ record:
   follow_mouse: true
   # 帧率，整数 1–60。
   fps: 15
-  # 视频码率（kbps），正整数。越大越清晰、文件越大。
+  # 视频平均码率（kbps）。动态码率：静止画面更低，变化大时最高到两倍。
   video_bitrate_kbps: 400
   # 编码最大宽/高（像素）。0 表示不缩小。两者都大于 0 时才按比例缩小。
   encode_max_width: 0
