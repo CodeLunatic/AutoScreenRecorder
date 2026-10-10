@@ -98,6 +98,26 @@ static std::wstring temp_recording_path(const std::wstring &final_mp4) {
 	return final_mp4.substr(0, dot) + L".tmp" + final_mp4.substr(dot);
 }
 
+static void ensure_parent_dir(const std::wstring &file_path) {
+	const auto slash = file_path.find_last_of(L"\\/");
+	if (slash == std::wstring::npos || slash == 0) return;
+	const std::wstring dir = file_path.substr(0, slash);
+	const DWORD attr = GetFileAttributesW(dir.c_str());
+	if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+	for (size_t i = 0; i < dir.size(); ++i) {
+		if (dir[i] != L'\\' && dir[i] != L'/') continue;
+		if (i < 3) continue;
+		CreateDirectoryW(dir.substr(0, i).c_str(), nullptr);
+	}
+	if (CreateDirectoryW(dir.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS) {
+		crash_log_trace("output dir created");
+	} else {
+		char line[96];
+		snprintf(line, sizeof(line), "output dir create failed: %lu", GetLastError());
+		crash_log_trace(line);
+	}
+}
+
 static int even_dim(int v) {
 	if (v <= 1) return 2;
 	return v & ~1;
@@ -2028,6 +2048,7 @@ int recorder_start(const wchar_t *path, uint64_t hmon, const native_rec_config *
 	g_hmon.store(hmon ? hmon : monitor_tracker_current());
 	g_final_path = path;
 	g_write_path = temp_recording_path(g_final_path);
+	ensure_parent_dir(g_final_path);
 	delete_file_if_exists(g_write_path.c_str());
 	g_video_frames.store(0);
 	g_writer_ready.store(false);

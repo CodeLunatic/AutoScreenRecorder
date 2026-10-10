@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -365,20 +367,30 @@ func (c *Controller) handleStartNow(e startNow) {
 	}
 	mon := c.recorder.CurrentMonitorHandle()
 	path := c.pathGen(c.lastProcess, c.sessionStart)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		log.Printf("创建保存目录失败: %v", err)
+		c.retryStartWhileMicHeld()
+		return
+	}
 	if err := c.recorder.Start(context.Background(), path, mon, cfg); err != nil {
 		log.Printf("start recording: %v", err)
-		if len(c.activeMic) > 0 {
-			retry := c.startDelay()
-			if retry < time.Second {
-				retry = time.Second
-			}
-			log.Printf("麦克风仍在占用，%s 后重试开录", retry)
-			c.scheduleStart(c.currentProcess(), retry)
-		}
+		c.retryStartWhileMicHeld()
 		return
 	}
 	c.recording = true
 	log.Printf("recording started: %s", path)
+}
+
+func (c *Controller) retryStartWhileMicHeld() {
+	if len(c.activeMic) == 0 {
+		return
+	}
+	retry := c.startDelay()
+	if retry < time.Second {
+		retry = time.Second
+	}
+	log.Printf("麦克风仍在占用，%s 后重试开录", retry)
+	c.scheduleStart(c.currentProcess(), retry)
 }
 
 func (c *Controller) handleStopNow(e stopNow) {
