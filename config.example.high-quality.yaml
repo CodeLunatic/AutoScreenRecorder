@@ -46,16 +46,18 @@ audio:
   # vbr：MP4 的 AAC 尝试动态码率。cbr：固定码率。WMV 的 WMA 始终是固定码率。
   bitrate_mode: vbr
   system:
-    # true/false。是否录系统默认扬声器。录制中更换 Windows 默认播放设备时会跟着切换。
+    # true/false。是否录播放设备。会同时录正在使用的各块播放设备，某一路没有数据会自动重开。
     enabled: true
   microphone:
-    # true/false。是否录系统默认麦克风。录制中更换 Windows 默认录音设备时会跟着切换。
+    # true/false。是否录麦克风。会同时录正在使用的各块麦克风，某一路没有数据会自动重开。
     enabled: true
+  # true：麦克风和电脑声音各自调整。小声慢慢抬高，大声立刻压低，安静时不抬底噪。
+  auto_level: true
   gain:
-    # 音量，单位 dB。0 为原音量，负数变小，正数变大。
+    # 单位 dB。自动音量打开时，这是在自动结果上再加减。关掉时，0 为原音量。
     system_db: 0.0
     microphone_db: 0.0
-  # true/false。true 时削掉过载采样，减轻爆音。
+  # true/false。混音超过满刻度时把音量压低，避免把波形削平造成破音。
   clip_limit: true
 
 output:

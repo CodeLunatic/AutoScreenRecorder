@@ -319,6 +319,9 @@ func toNativeRecConfig(cfg config.Config) C.native_rec_config {
 	}
 	nc.gain_system_db = C.float(a.Gain.SystemDB)
 	nc.gain_mic_db = C.float(a.Gain.MicrophoneDB)
+	if a.AutoLevel {
+		nc.auto_level = 1
+	}
 	if a.ClipLimit {
 		nc.clip_limit = 1
 	}

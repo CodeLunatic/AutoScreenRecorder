@@ -8,6 +8,7 @@
 #include <mferror.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <propsys.h>
 #include <avrt.h>
 #include <mmreg.h>
 #include <timeapi.h>
@@ -95,6 +96,12 @@ static std::condition_variable g_fin_cv;
 static bool g_fin_busy = false;
 static std::atomic<bool> g_timer_period{false};
 static float g_limit_gain = 1.f;
+struct BusLevel {
+	float env = 0.45f;
+	float gain = 1.f;
+};
+static BusLevel g_level_system;
+static BusLevel g_level_mic;
 static std::atomic<long> g_last_mf_hr{0};
 static std::wstring g_final_path;
 static std::wstring g_write_path;
@@ -541,13 +548,6 @@ static uint64_t file_size_bytes(const wchar_t *path) {
 	sz.LowPart = info.nFileSizeLow;
 	sz.HighPart = info.nFileSizeHigh;
 	return sz.QuadPart;
-}
-
-static void clamp_audio(float *s, size_t n) {
-	for (size_t i = 0; i < n; i++) {
-		if (s[i] > 1.f) s[i] = 1.f;
-		if (s[i] < -1.f) s[i] = -1.f;
-	}
 }
 
 enum {
@@ -1550,6 +1550,8 @@ static bool is_float_format(const WAVEFORMATEX *wfx) {
 	return false;
 }
 
+static HRESULT g_last_open_hr = E_FAIL;
+
 static int open_wasapi_impl(IMMDevice *dev, bool loopback, DWORD capture_flags, bool event_mode, WasapiCapture *out) {
 	*out = WasapiCapture{};
 	IAudioClient *client = nullptr;
@@ -1575,6 +1577,18 @@ static int open_wasapi_impl(IMMDevice *dev, bool loopback, DWORD capture_flags, 
 
 	HRESULT hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, mix, nullptr);
 	if (FAILED(hr)) {
+		g_last_open_hr = hr;
+		client->Release();
+		client = nullptr;
+		if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **)&client)) || !client) {
+			if (ev) CloseHandle(ev);
+			CoTaskMemFree(mix);
+			return -1;
+		}
+		hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, mix, nullptr);
+	}
+	if (FAILED(hr)) {
+		g_last_open_hr = hr;
 		if (ev) CloseHandle(ev);
 		CoTaskMemFree(mix);
 		client->Release();
@@ -1639,6 +1653,13 @@ static int open_wasapi(IMMDevice *dev, bool loopback, WasapiCapture *out) {
 	if (loopback) flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
 
 	HRESULT hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, &fmt, nullptr);
+	if (FAILED(hr)) {
+		g_last_open_hr = hr;
+		client->Release();
+		client = nullptr;
+		if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **)&client)) || !client) return -1;
+		hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, &fmt, nullptr);
+	}
 	if (SUCCEEDED(hr)) {
 		out->wfx = dup_format(&fmt);
 		IAudioCaptureClient *cap = nullptr;
@@ -1660,6 +1681,7 @@ static int open_wasapi(IMMDevice *dev, bool loopback, WasapiCapture *out) {
 		out->poll_mode = true;
 		return 0;
 	}
+	g_last_open_hr = hr;
 	client->Release();
 	if (loopback) return open_wasapi_impl(dev, true, 0, false, out);
 	const DWORD kAuto = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
@@ -1734,9 +1756,24 @@ static void close_wasapi(WasapiCapture *c) {
 	*c = WasapiCapture{};
 }
 
+static void fold_channel_sum(float sum, int ch, float *l, float *r, float c0, float c1) {
+	if (ch <= 1) {
+		*l = *r = c0;
+		return;
+	}
+	if (ch == 2) {
+		*l = c0;
+		*r = c1;
+		return;
+	}
+	const float v = sum / static_cast<float>(ch);
+	*l = v;
+	*r = v;
+}
+
 static void decode_to_stereo_float(const WasapiCapture *cap, const BYTE *data, UINT32 frames, DWORD flags, float *out_lr) {
 	const WAVEFORMATEX *wfx = cap->wfx;
-	const int ch = wfx && wfx->nChannels > 0 ? wfx->nChannels : 2;
+	int ch = wfx && wfx->nChannels > 0 ? wfx->nChannels : 2;
 	const int block = wfx && wfx->nBlockAlign > 0 ? wfx->nBlockAlign : (ch * (wfx && wfx->wBitsPerSample ? wfx->wBitsPerSample / 8 : 4));
 
 	if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
@@ -1745,10 +1782,13 @@ static void decode_to_stereo_float(const WasapiCapture *cap, const BYTE *data, U
 	}
 
 	if (is_float_format(wfx)) {
+		if (block / static_cast<int>(sizeof(float)) < ch) ch = std::max(1, block / static_cast<int>(sizeof(float)));
 		for (UINT32 i = 0; i < frames; i++) {
 			const float *f = reinterpret_cast<const float *>(data + static_cast<size_t>(i) * block);
-			float l = f[0];
-			float r = (ch > 1) ? f[1] : l;
+			float sum = 0.f;
+			for (int c = 0; c < ch; c++) sum += f[c];
+			float l = 0.f, r = 0.f;
+			fold_channel_sum(sum, ch, &l, &r, f[0], ch > 1 ? f[1] : f[0]);
 			out_lr[i * 2 + 0] = l * cap->gain;
 			out_lr[i * 2 + 1] = r * cap->gain;
 		}
@@ -1756,10 +1796,13 @@ static void decode_to_stereo_float(const WasapiCapture *cap, const BYTE *data, U
 	}
 
 	if (wfx && is_pcm_format(wfx) && wfx->wBitsPerSample == 16) {
+		if (block / static_cast<int>(sizeof(int16_t)) < ch) ch = std::max(1, block / static_cast<int>(sizeof(int16_t)));
 		for (UINT32 i = 0; i < frames; i++) {
 			const int16_t *s = reinterpret_cast<const int16_t *>(data + static_cast<size_t>(i) * block);
-			float l = s[0] / 32768.f;
-			float r = (ch > 1) ? (s[1] / 32768.f) : l;
+			float sum = 0.f;
+			for (int c = 0; c < ch; c++) sum += s[c] / 32768.f;
+			float l = 0.f, r = 0.f;
+			fold_channel_sum(sum, ch, &l, &r, s[0] / 32768.f, ch > 1 ? s[1] / 32768.f : s[0] / 32768.f);
 			out_lr[i * 2 + 0] = l * cap->gain;
 			out_lr[i * 2 + 1] = r * cap->gain;
 		}
@@ -1767,10 +1810,13 @@ static void decode_to_stereo_float(const WasapiCapture *cap, const BYTE *data, U
 	}
 
 	if (wfx && is_pcm_format(wfx) && wfx->wBitsPerSample == 32) {
+		if (block / static_cast<int>(sizeof(int32_t)) < ch) ch = std::max(1, block / static_cast<int>(sizeof(int32_t)));
 		for (UINT32 i = 0; i < frames; i++) {
 			const int32_t *s = reinterpret_cast<const int32_t *>(data + static_cast<size_t>(i) * block);
-			float l = s[0] / 2147483648.f;
-			float r = (ch > 1) ? (s[1] / 2147483648.f) : l;
+			float sum = 0.f;
+			for (int c = 0; c < ch; c++) sum += s[c] / 2147483648.f;
+			float l = 0.f, r = 0.f;
+			fold_channel_sum(sum, ch, &l, &r, s[0] / 2147483648.f, ch > 1 ? s[1] / 2147483648.f : s[0] / 2147483648.f);
 			out_lr[i * 2 + 0] = l * cap->gain;
 			out_lr[i * 2 + 1] = r * cap->gain;
 		}
@@ -1840,104 +1886,203 @@ static void consume_audio_hold(std::vector<float> *hold, UINT32 frames) {
 	else hold->erase(hold->begin(), hold->begin() + n);
 }
 
-static void shape_mix(float *s, size_t n) {
-	if (!s || n == 0) return;
-	if (g_cfg.clip_limit) {
-		clamp_audio(s, n);
-		g_limit_gain = 1.f;
-		return;
-	}
-	float peak = 0.f;
+static void reset_bus_level(BusLevel *st) {
+	if (!st) return;
+	st->env = 0.45f;
+	st->gain = 1.f;
+}
+
+static float agc_coef(float seconds) {
+	return 1.f - expf(-1.f / (static_cast<float>(std::max(1, effective_audio_sample_rate_hz())) * seconds));
+}
+
+static void level_bus(float *s, size_t n, BusLevel *st, float extra_db) {
+	if (!s || n == 0 || !st) return;
+	const float env_up = agc_coef(0.02f);
+	const float env_down = agc_coef(0.20f);
+	const float gain_up = agc_coef(0.70f);
+	const float gain_idle = agc_coef(0.50f);
+	const float target = 0.45f * db_to_linear(extra_db);
+	const float max_g = db_to_linear(24.f);
+	const float min_g = db_to_linear(-18.f);
+	const float gate = db_to_linear(-50.f);
+	const float ceiling = 0.70f;
 	for (size_t i = 0; i < n; i++) {
 		const float a = fabsf(s[i]);
-		if (a > peak) peak = a;
-	}
-	float target = peak > 1.f ? 1.f / peak : 1.f;
-	for (size_t i = 0; i < n; i++) {
-		g_limit_gain += (target - g_limit_gain) * 0.002f;
-		s[i] *= g_limit_gain;
-		if (s[i] > 1.f) s[i] = 1.f;
-		if (s[i] < -1.f) s[i] = -1.f;
+		const float ec = a > st->env ? env_up : env_down;
+		st->env += (a - st->env) * ec;
+		if (st->env < gate) {
+			st->gain += (1.f - st->gain) * gain_idle;
+		} else {
+			float desired = target / st->env;
+			if (desired > max_g) desired = max_g;
+			if (desired < min_g) desired = min_g;
+			if (a > 1e-8f) {
+				const float cap = ceiling / a;
+				if (desired > cap) desired = cap;
+			}
+			if (desired < st->gain) st->gain = desired;
+			else st->gain += (desired - st->gain) * gain_up;
+		}
+		s[i] *= st->gain;
 	}
 }
 
-static bool drain_and_mix(WasapiCapture *sys, WasapiCapture *mic, std::vector<float> *sys_hold, std::vector<float> *mic_hold, std::vector<int16_t> *pcm_out, UINT32 *out_frames, LONGLONG *capture_pts) {
-	if (capture_pts) *capture_pts = -1;
-	auto drain_one = [&](WasapiCapture *cap, std::vector<float> *chunks) {
-		if (!cap || !cap->cap || !chunks) return;
-		UINT32 packet = 0;
-		if (FAILED(cap->cap->GetNextPacketSize(&packet))) return;
-		int packet_budget = 64;
-		while (packet && packet_budget-- > 0 && g_rec_active.load()) {
-			BYTE *data = nullptr;
-			UINT32 frames = 0;
-			DWORD flags = 0;
-			UINT64 qpc = 0;
-			const HRESULT hr = cap->cap->GetBuffer(&data, &frames, &flags, nullptr, &qpc);
-			if (FAILED(hr)) break;
-			if (frames > 0 && data) {
-				if (capture_pts && *capture_pts < 0 && qpc != 0 && g_qpc_freq.QuadPart != 0) {
-					LONGLONG pts = qpc_delta_to_100ns(static_cast<LONGLONG>(qpc) - g_qpc_start.QuadPart);
-					if (pts < 0) pts = 0;
-					*capture_pts = pts;
-				}
-				std::vector<float> tmp(static_cast<size_t>(frames) * 2);
-				decode_to_stereo_float(cap, data, frames, flags, tmp.data());
-				const int rate = cap->wfx ? static_cast<int>(cap->wfx->nSamplesPerSec) : 48000;
-				std::vector<float> rs;
-				resample_to_output_rate(&cap->resample, tmp.data(), frames, rate, &rs);
-				chunks->insert(chunks->end(), rs.begin(), rs.end());
-			}
-			cap->cap->ReleaseBuffer(frames);
-			if (FAILED(cap->cap->GetNextPacketSize(&packet))) break;
-		}
-		trim_audio_hold(chunks);
-	};
-
-	drain_one(sys, sys_hold);
-	drain_one(mic, mic_hold);
-
-	const bool has_sys = sys && sys->cap;
-	const bool has_mic = mic && mic->cap;
-	UINT32 sn = has_sys ? static_cast<UINT32>(sys_hold->size() / 2) : 0;
-	UINT32 mn = has_mic ? static_cast<UINT32>(mic_hold->size() / 2) : 0;
-	const UINT32 lead = static_cast<UINT32>(std::max(1, effective_audio_sample_rate_hz() / 10));
-	bool use_sys = has_sys;
-	bool use_mic = has_mic;
-	UINT32 n = 0;
-	if (has_sys && has_mic) {
-		if (sn == 0 && mn > lead) {
-			n = mn - lead;
-			use_sys = false;
-		} else if (mn == 0 && sn > lead) {
-			n = sn - lead;
-			use_mic = false;
-		} else {
-			n = std::min(sn, mn);
-		}
-	} else if (has_sys) {
-		n = sn;
-	} else if (has_mic) {
-		n = mn;
+static void shape_mix(float *s, size_t n) {
+	if (!s || n == 0) return;
+	const float rel = 1.f - expf(-1.f / (static_cast<float>(std::max(1, effective_audio_sample_rate_hz())) * 0.08f));
+	for (size_t i = 0; i < n; i++) {
+		const float a = fabsf(s[i]);
+		const float need = a > 1.f ? 1.f / a : 1.f;
+		if (need < g_limit_gain) g_limit_gain = need;
+		else g_limit_gain += (need - g_limit_gain) * rel;
+		s[i] *= g_limit_gain;
 	}
-	if (n == 0) return false;
+}
+
+struct LiveInput {
+	WasapiCapture cap;
+	std::wstring id;
+	std::wstring name;
+	std::vector<float> hold;
+	ULONGLONG last_packet_ms = 0;
+	ULONGLONG opened_ms = 0;
+	ULONGLONG next_reopen_ms = 0;
+	int reopen_count = 0;
+	bool loopback = false;
+
+	LiveInput() = default;
+	LiveInput(const LiveInput &) = delete;
+	LiveInput &operator=(const LiveInput &) = delete;
+	LiveInput(LiveInput &&o) noexcept
+		: cap(o.cap),
+		  id(std::move(o.id)),
+		  name(std::move(o.name)),
+		  hold(std::move(o.hold)),
+		  last_packet_ms(o.last_packet_ms),
+		  opened_ms(o.opened_ms),
+		  next_reopen_ms(o.next_reopen_ms),
+		  reopen_count(o.reopen_count),
+		  loopback(o.loopback) {
+		o.cap = WasapiCapture{};
+		o.last_packet_ms = 0;
+		o.opened_ms = 0;
+		o.next_reopen_ms = 0;
+		o.reopen_count = 0;
+		o.loopback = false;
+	}
+	LiveInput &operator=(LiveInput &&o) noexcept {
+		if (this == &o) return *this;
+		close_wasapi(&cap);
+		cap = o.cap;
+		o.cap = WasapiCapture{};
+		id = std::move(o.id);
+		name = std::move(o.name);
+		hold = std::move(o.hold);
+		last_packet_ms = o.last_packet_ms;
+		opened_ms = o.opened_ms;
+		next_reopen_ms = o.next_reopen_ms;
+		reopen_count = o.reopen_count;
+		loopback = o.loopback;
+		o.last_packet_ms = 0;
+		o.opened_ms = 0;
+		o.next_reopen_ms = 0;
+		o.reopen_count = 0;
+		o.loopback = false;
+		return *this;
+	}
+	~LiveInput() { close_wasapi(&cap); }
+};
+
+static int drain_live(LiveInput *in, LONGLONG *capture_pts) {
+	if (!in || !in->cap.cap) return 0;
+	UINT32 packet = 0;
+	if (FAILED(in->cap.cap->GetNextPacketSize(&packet))) {
+		in->last_packet_ms = in->opened_ms;
+		return 0;
+	}
+	int got = 0;
+	int packet_budget = 64;
+	while (packet && packet_budget-- > 0 && g_rec_active.load()) {
+		BYTE *data = nullptr;
+		UINT32 frames = 0;
+		DWORD flags = 0;
+		UINT64 qpc = 0;
+		const HRESULT hr = in->cap.cap->GetBuffer(&data, &frames, &flags, nullptr, &qpc);
+		if (FAILED(hr)) {
+			in->last_packet_ms = in->opened_ms;
+			break;
+		}
+		if (frames > 0) {
+			got += static_cast<int>(frames);
+			if (capture_pts && *capture_pts < 0 && qpc != 0 && g_qpc_freq.QuadPart != 0) {
+				LONGLONG pts = qpc_delta_to_100ns(static_cast<LONGLONG>(qpc) - g_qpc_start.QuadPart);
+				if (pts < 0) pts = 0;
+				*capture_pts = pts;
+			}
+			if (data) {
+				std::vector<float> tmp(static_cast<size_t>(frames) * 2);
+				decode_to_stereo_float(&in->cap, data, frames, flags, tmp.data());
+				const int rate = in->cap.wfx ? static_cast<int>(in->cap.wfx->nSamplesPerSec) : 48000;
+				std::vector<float> rs;
+				resample_to_output_rate(&in->cap.resample, tmp.data(), frames, rate, &rs);
+				in->hold.insert(in->hold.end(), rs.begin(), rs.end());
+			}
+		}
+		in->cap.cap->ReleaseBuffer(frames);
+		if (FAILED(in->cap.cap->GetNextPacketSize(&packet))) {
+			in->last_packet_ms = in->opened_ms;
+			break;
+		}
+	}
+	if (got > 0) in->last_packet_ms = GetTickCount64();
+	trim_audio_hold(&in->hold);
+	return got;
+}
+
+static void add_live_hold(LiveInput *in, std::vector<float> *mix, UINT32 n) {
+	if (!in || !mix || n == 0) return;
+	const UINT32 avail = static_cast<UINT32>(in->hold.size() / 2);
+	const UINT32 use = std::min(avail, n);
+	for (UINT32 i = 0; i < use; i++) {
+		(*mix)[static_cast<size_t>(i) * 2 + 0] += in->hold[static_cast<size_t>(i) * 2 + 0];
+		(*mix)[static_cast<size_t>(i) * 2 + 1] += in->hold[static_cast<size_t>(i) * 2 + 1];
+	}
+	consume_audio_hold(&in->hold, use);
+}
+
+static bool mix_live(std::vector<LiveInput> *speakers, std::vector<LiveInput> *mics, std::vector<int16_t> *pcm_out, UINT32 *out_frames, LONGLONG *capture_pts, UINT32 timeline_frames) {
+	if (capture_pts) *capture_pts = -1;
+	auto drain_all = [&](std::vector<LiveInput> *list) {
+		if (!list) return;
+		for (auto &in : *list) drain_live(&in, capture_pts);
+	};
+	drain_all(speakers);
+	drain_all(mics);
+	bool any_open = false;
+	auto note_open = [&](std::vector<LiveInput> *list) {
+		if (!list) return;
+		for (const auto &in : *list) {
+			if (in.cap.cap) any_open = true;
+		}
+	};
+	note_open(speakers);
+	note_open(mics);
+	if (!any_open || timeline_frames == 0) return false;
+	const UINT32 n = timeline_frames;
 
 	std::vector<float> mix(static_cast<size_t>(n) * 2, 0.f);
-	for (UINT32 i = 0; i < n; i++) {
-		float l = 0.f, r = 0.f;
-		if (use_sys && sys_hold->size() >= static_cast<size_t>(i) * 2 + 2) {
-			l += (*sys_hold)[i * 2 + 0];
-			r += (*sys_hold)[i * 2 + 1];
+	std::vector<float> bus(static_cast<size_t>(n) * 2, 0.f);
+	auto take_bus = [&](std::vector<LiveInput> *list, BusLevel *level, float extra_db) {
+		std::fill(bus.begin(), bus.end(), 0.f);
+		if (list) {
+			for (auto &in : *list) add_live_hold(&in, &bus, n);
 		}
-		if (use_mic && mic_hold->size() >= static_cast<size_t>(i) * 2 + 2) {
-			l += (*mic_hold)[i * 2 + 0];
-			r += (*mic_hold)[i * 2 + 1];
-		}
-		mix[i * 2 + 0] = l;
-		mix[i * 2 + 1] = r;
-	}
-	if (use_sys) consume_audio_hold(sys_hold, n);
-	if (use_mic) consume_audio_hold(mic_hold, n);
+		if (g_cfg.auto_level) level_bus(bus.data(), bus.size(), level, extra_db);
+		for (size_t i = 0; i < mix.size(); i++) mix[i] += bus[i];
+	};
+	take_bus(speakers, &g_level_system, g_cfg.gain_system_db);
+	take_bus(mics, &g_level_mic, g_cfg.gain_mic_db);
 
 	shape_mix(mix.data(), mix.size());
 	const int ch = audio_channels();
@@ -1984,14 +2129,20 @@ public:
 		if (n == 0) delete this;
 		return n;
 	}
-	STDMETHODIMP OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
-	STDMETHODIMP OnDeviceAdded(LPCWSTR) override { return S_OK; }
+	STDMETHODIMP OnDeviceStateChanged(LPCWSTR, DWORD) override {
+		g_default_dev_gen.fetch_add(1);
+		return S_OK;
+	}
+	STDMETHODIMP OnDeviceAdded(LPCWSTR) override {
+		g_default_dev_gen.fetch_add(1);
+		return S_OK;
+	}
 	STDMETHODIMP OnDeviceRemoved(LPCWSTR) override {
 		g_default_dev_gen.fetch_add(1);
 		return S_OK;
 	}
-	STDMETHODIMP OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
-		if (role == eConsole && (flow == eRender || flow == eCapture)) g_default_dev_gen.fetch_add(1);
+	STDMETHODIMP OnDefaultDeviceChanged(EDataFlow flow, ERole, LPCWSTR) override {
+		if (flow == eRender || flow == eCapture) g_default_dev_gen.fetch_add(1);
 		return S_OK;
 	}
 	STDMETHODIMP OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
@@ -2006,46 +2157,288 @@ static std::wstring device_id_of(IMMDevice *dev) {
 	return s;
 }
 
-static void bind_default_speaker(IMMDeviceEnumerator *en, WasapiCapture *sys, std::wstring *cur_id, std::vector<float> *hold) {
-	if (!g_cfg.system_enabled || !en) return;
-	IMMDevice *dev = default_render_device(en);
-	const std::wstring nid = device_id_of(dev);
-	if (sys->cap && nid == *cur_id) {
-		if (dev) dev->Release();
-		return;
-	}
-	close_wasapi(sys);
-	if (hold) hold->clear();
-	if (dev && open_wasapi(dev, true, sys) == 0) {
-		sys->gain = db_to_linear(g_cfg.gain_system_db);
-		*cur_id = nid;
-		crash_log_trace("audio: using system default speaker");
-	} else {
-		*cur_id = L"";
-		crash_log_trace("audio: default speaker unavailable");
-	}
-	if (dev) dev->Release();
+static const PROPERTYKEY kDeviceFriendlyName = {
+	{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
+	14};
+
+static std::wstring device_friendly_name(IMMDevice *dev) {
+	if (!dev) return L"";
+	IPropertyStore *store = nullptr;
+	if (FAILED(dev->OpenPropertyStore(STGM_READ, &store)) || !store) return L"";
+	PROPVARIANT v;
+	PropVariantInit(&v);
+	std::wstring name;
+	if (SUCCEEDED(store->GetValue(kDeviceFriendlyName, &v)) && v.vt == VT_LPWSTR && v.pwszVal) name = v.pwszVal;
+	PropVariantClear(&v);
+	store->Release();
+	return name;
 }
 
-static void bind_default_microphone(IMMDeviceEnumerator *en, WasapiCapture *mic, std::wstring *cur_id, std::vector<float> *hold) {
-	if (!g_cfg.mic_enabled || !en) return;
-	IMMDevice *dev = default_capture_device(en);
-	const std::wstring nid = device_id_of(dev);
-	if (mic->cap && nid == *cur_id) {
-		if (dev) dev->Release();
+static bool name_has_mirroring(const std::wstring &name) {
+	const wchar_t needle[] = L"mirroring";
+	const size_t nlen = 10;
+	if (name.size() < nlen) return false;
+	for (size_t i = 0; i + nlen <= name.size(); i++) {
+		bool match = true;
+		for (size_t k = 0; k < nlen; k++) {
+			wchar_t c = name[i + k];
+			if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+			if (c != needle[k]) {
+				match = false;
+				break;
+			}
+		}
+		if (match) return true;
+	}
+	return false;
+}
+
+static LiveInput *find_live(std::vector<LiveInput> &list, const std::wstring &id) {
+	for (auto &in : list) {
+		if (in.id == id) return &in;
+	}
+	return nullptr;
+}
+
+static std::wstring lower_name(std::wstring s) {
+	for (auto &c : s) {
+		if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+	}
+	return s;
+}
+
+static bool name_is_virtual_cable(const std::wstring &name) {
+	const std::wstring lower = lower_name(name);
+	return lower.find(L"vb-audio") != std::wstring::npos || lower.find(L"virtual cable") != std::wstring::npos;
+}
+
+static std::wstring cable_key(std::wstring name) {
+	std::wstring s = lower_name(std::move(name));
+	auto erase_word = [&](const wchar_t *token) {
+		const size_t n = wcslen(token);
+		size_t p = 0;
+		while ((p = s.find(token, p)) != std::wstring::npos) {
+			const bool left = p == 0 || s[p - 1] == L' ' || s[p - 1] == L'-';
+			const bool right = p + n >= s.size() || s[p + n] == L' ' || s[p + n] == L'(' || s[p + n] == L')';
+			if (left && right) s.erase(p, n);
+			else p += n;
+		}
+	};
+	erase_word(L"input");
+	erase_word(L"output");
+	std::wstring out;
+	bool space = false;
+	for (wchar_t c : s) {
+		if (c == L' ') {
+			if (!space && !out.empty()) out.push_back(L' ');
+			space = true;
+		} else {
+			out.push_back(c);
+			space = false;
+		}
+	}
+	return out;
+}
+
+struct OpenRetry {
+	std::wstring id;
+	ULONGLONG next_ms = 0;
+	int count = 0;
+};
+static std::vector<OpenRetry> g_open_retries;
+
+static void clear_open_retries() { g_open_retries.clear(); }
+
+static bool open_retry_waiting(const std::wstring &id) {
+	const ULONGLONG now = GetTickCount64();
+	for (const auto &r : g_open_retries) {
+		if (r.id == id) return now < r.next_ms;
+	}
+	return false;
+}
+
+static void note_open_failed(const std::wstring &id) {
+	const ULONGLONG now = GetTickCount64();
+	for (auto &r : g_open_retries) {
+		if (r.id != id) continue;
+		r.count++;
+		ULONGLONG backoff = 2000;
+		if (r.count == 2) backoff = 10000;
+		else if (r.count >= 3) backoff = 30000;
+		r.next_ms = now + backoff;
 		return;
 	}
-	close_wasapi(mic);
-	if (hold) hold->clear();
-	if (dev && open_wasapi(dev, false, mic) == 0) {
-		mic->gain = db_to_linear(g_cfg.gain_mic_db);
-		*cur_id = nid;
-		crash_log_trace("audio: using system default microphone");
-	} else {
-		*cur_id = L"";
-		crash_log_trace("audio: default microphone unavailable");
+	OpenRetry retry;
+	retry.id = id;
+	retry.next_ms = now + 2000;
+	retry.count = 1;
+	g_open_retries.push_back(std::move(retry));
+}
+
+static void note_open_ok(const std::wstring &id) {
+	for (auto it = g_open_retries.begin(); it != g_open_retries.end(); ++it) {
+		if (it->id == id) {
+			g_open_retries.erase(it);
+			return;
+		}
 	}
-	if (dev) dev->Release();
+}
+
+static bool render_cable_is_open(const std::vector<LiveInput> *renders, const std::wstring &key) {
+	if (!renders || key.empty()) return false;
+	for (const auto &in : *renders) {
+		if (!in.cap.cap || !name_is_virtual_cable(in.name)) continue;
+		if (cable_key(in.name) == key) return true;
+	}
+	return false;
+}
+
+static bool open_live(std::vector<LiveInput> &list, IMMDevice *dev, bool loopback) {
+	if (!dev) return false;
+	const std::wstring id = device_id_of(dev);
+	if (id.empty() || find_live(list, id)) return false;
+	const std::wstring name = device_friendly_name(dev);
+	if (name_has_mirroring(name)) {
+		trace_wpath("audio: skip mirroring", name.c_str());
+		return false;
+	}
+	LiveInput item;
+	item.loopback = loopback;
+	if (open_wasapi(dev, loopback, &item.cap) != 0) {
+		tracef("audio: %s failed hr=0x%08lX", loopback ? "loopback" : "capture", static_cast<unsigned long>(g_last_open_hr));
+		trace_wpath(loopback ? "audio: loopback failed" : "audio: capture failed", name.empty() ? id.c_str() : name.c_str());
+		return false;
+	}
+	item.cap.gain = g_cfg.auto_level ? 1.f : db_to_linear(loopback ? g_cfg.gain_system_db : g_cfg.gain_mic_db);
+	item.id = id;
+	item.name = name.empty() ? id : name;
+	const ULONGLONG now = GetTickCount64();
+	item.opened_ms = now;
+	item.last_packet_ms = now;
+	item.next_reopen_ms = now + 2000;
+	item.reopen_count = 0;
+	trace_wpath(loopback ? "audio: loopback" : "audio: capture", item.name.c_str());
+	list.push_back(std::move(item));
+	return true;
+}
+
+static void collect_role_devices(IMMDeviceEnumerator *en, EDataFlow flow, std::vector<IMMDevice *> &devs) {
+	const ERole roles[] = {eConsole, eMultimedia, eCommunications};
+	for (ERole role : roles) {
+		IMMDevice *dev = nullptr;
+		if (SUCCEEDED(en->GetDefaultAudioEndpoint(flow, role, &dev)) && dev) devs.push_back(dev);
+	}
+}
+
+static void collect_active_devices(IMMDeviceEnumerator *en, EDataFlow flow, std::vector<IMMDevice *> &devs) {
+	IMMDeviceCollection *coll = nullptr;
+	if (FAILED(en->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &coll)) || !coll) return;
+	UINT count = 0;
+	coll->GetCount(&count);
+	for (UINT i = 0; i < count; i++) {
+		IMMDevice *dev = nullptr;
+		if (SUCCEEDED(coll->Item(i, &dev)) && dev) devs.push_back(dev);
+	}
+	coll->Release();
+}
+
+static void release_devs(std::vector<IMMDevice *> &devs) {
+	for (auto *dev : devs) {
+		if (dev) dev->Release();
+	}
+	devs.clear();
+}
+
+static bool id_wanted(const std::vector<std::wstring> &want, const std::wstring &id) {
+	for (const auto &w : want) {
+		if (w == id) return true;
+	}
+	return false;
+}
+
+static void sync_inputs(IMMDeviceEnumerator *en, std::vector<LiveInput> &list, bool loopback, const std::vector<LiveInput> *renders) {
+	if (!en) return;
+	const bool enabled = loopback ? g_cfg.system_enabled != 0 : g_cfg.mic_enabled != 0;
+	if (!enabled) {
+		if (!list.empty()) {
+			tracef("audio: closed %s inputs=%d", loopback ? "render" : "capture", static_cast<int>(list.size()));
+			list.clear();
+		}
+		return;
+	}
+	std::vector<IMMDevice *> devs;
+	if (loopback) {
+		collect_role_devices(en, eRender, devs);
+		collect_active_devices(en, eRender, devs);
+	} else {
+		collect_role_devices(en, eCapture, devs);
+		collect_active_devices(en, eCapture, devs);
+	}
+	std::vector<std::wstring> want;
+	for (auto *dev : devs) {
+		const std::wstring id = device_id_of(dev);
+		if (id.empty() || id_wanted(want, id)) continue;
+		const std::wstring name = device_friendly_name(dev);
+		if (name_has_mirroring(name)) continue;
+		if (!loopback && name_is_virtual_cable(name) && render_cable_is_open(renders, cable_key(name))) continue;
+		if (!find_live(list, id)) {
+			if (open_retry_waiting(id)) continue;
+			if (!open_live(list, dev, loopback)) {
+				note_open_failed(id);
+				continue;
+			}
+			note_open_ok(id);
+		}
+		want.push_back(id);
+	}
+	for (auto it = list.begin(); it != list.end();) {
+		if (id_wanted(want, it->id)) {
+			++it;
+			continue;
+		}
+		trace_wpath(loopback ? "audio: drop loopback" : "audio: drop capture", it->name.c_str());
+		it = list.erase(it);
+	}
+	release_devs(devs);
+	static int render_logged = -1;
+	static int capture_logged = -1;
+	int *logged = loopback ? &render_logged : &capture_logged;
+	const int n = static_cast<int>(list.size());
+	if (*logged != n) {
+		*logged = n;
+		tracef("audio: %s inputs=%d", loopback ? "render" : "capture", n);
+	}
+}
+
+static void reopen_silent(IMMDeviceEnumerator *en, std::vector<LiveInput> &list) {
+	if (!en) return;
+	const ULONGLONG now = GetTickCount64();
+	for (auto &item : list) {
+		if (now < item.next_reopen_ms) continue;
+		if (now - item.last_packet_ms < 2000) {
+			item.next_reopen_ms = item.last_packet_ms + 2000;
+			item.reopen_count = 0;
+			continue;
+		}
+		trace_wpath(item.loopback ? "audio: reopening silent loopback" : "audio: reopening silent capture", item.name.c_str());
+		IMMDevice *dev = nullptr;
+		en->GetDevice(item.id.c_str(), &dev);
+		close_wasapi(&item.cap);
+		item.hold.clear();
+		item.reopen_count++;
+		ULONGLONG backoff = 2000;
+		if (item.reopen_count == 2) backoff = 10000;
+		else if (item.reopen_count >= 3) backoff = 30000;
+		item.opened_ms = now;
+		item.last_packet_ms = now;
+		item.next_reopen_ms = now + backoff;
+		if (dev && open_wasapi(dev, item.loopback, &item.cap) == 0) {
+			item.cap.gain = g_cfg.auto_level ? 1.f : db_to_linear(item.loopback ? g_cfg.gain_system_db : g_cfg.gain_mic_db);
+		} else {
+			trace_wpath(item.loopback ? "audio: loopback reopen failed" : "audio: capture reopen failed", item.name.c_str());
+		}
+		if (dev) dev->Release();
+	}
 }
 
 static void audio_loop(void) {
@@ -2072,37 +2465,52 @@ static void audio_loop(void) {
 			notify = nullptr;
 		}
 	}
-	WasapiCapture sys{}, mic{};
-	std::wstring sys_id, mic_id;
-	std::vector<float> sys_hold, mic_hold;
-	int seen_gen = g_default_dev_gen.load();
-	bind_default_speaker(enumerator, &sys, &sys_id, &sys_hold);
-	bind_default_microphone(enumerator, &mic, &mic_id, &mic_hold);
+	std::vector<LiveInput> speakers;
+	std::vector<LiveInput> mics;
+	clear_open_retries();
+	int seen_gen = g_default_dev_gen.load() - 1;
+	ULONGLONG last_sync = 0;
+	ULONGLONG audio_clock = 0;
 
 	std::vector<int16_t> pcm;
 	LONGLONG next_pts = 0;
 	while (g_rec_active.load()) {
+		const ULONGLONG now = GetTickCount64();
 		const int gen = g_default_dev_gen.load();
-		if (gen != seen_gen) {
+		if (last_sync == 0 || (gen != seen_gen && now - last_sync >= 500) || now - last_sync >= 2000) {
+			if (gen != seen_gen && last_sync != 0) crash_log_trace("audio: device list changed");
 			seen_gen = gen;
-			crash_log_trace("audio: system default device changed");
-			bind_default_speaker(enumerator, &sys, &sys_id, &sys_hold);
-			bind_default_microphone(enumerator, &mic, &mic_id, &mic_hold);
+			last_sync = now;
+			sync_inputs(enumerator, speakers, true, nullptr);
+			sync_inputs(enumerator, mics, false, &speakers);
+			reopen_silent(enumerator, speakers);
+			reopen_silent(enumerator, mics);
 		}
 
-		HANDLE waits[2];
+		HANDLE waits[64];
 		DWORD wait_n = 0;
-		if (sys.event) waits[wait_n++] = sys.event;
-		if (mic.event) waits[wait_n++] = mic.event;
-		if (wait_n > 0) {
-			WaitForMultipleObjects(wait_n, waits, FALSE, 20);
-		} else {
-			Sleep(5);
+		for (auto &in : speakers) {
+			if (in.cap.event && wait_n < 64) waits[wait_n++] = in.cap.event;
 		}
+		for (auto &in : mics) {
+			if (in.cap.event && wait_n < 64) waits[wait_n++] = in.cap.event;
+		}
+		if (wait_n > 0) WaitForMultipleObjects(wait_n, waits, FALSE, 20);
+		else Sleep(5);
+
+		const ULONGLONG tnow = GetTickCount64();
+		UINT32 want = 0;
+		if (audio_clock != 0 && tnow > audio_clock) {
+			const int rate = effective_audio_sample_rate_hz();
+			want = static_cast<UINT32>((tnow - audio_clock) * static_cast<ULONGLONG>(rate) / 1000ULL);
+			const UINT32 cap = rate > 0 ? static_cast<UINT32>(rate) : 0;
+			if (want > cap) want = cap;
+		}
+		audio_clock = tnow;
 
 		UINT32 frames = 0;
 		LONGLONG capture_pts = -1;
-		if (!drain_and_mix(&sys, &mic, &sys_hold, &mic_hold, &pcm, &frames, &capture_pts) || frames == 0) continue;
+		if (!mix_live(&speakers, &mics, &pcm, &frames, &capture_pts, want) || frames == 0) continue;
 
 		if (!g_with_audio.load()) continue;
 		const LONGLONG dur = (10000000LL * frames) / effective_audio_sample_rate_hz();
@@ -2121,8 +2529,8 @@ static void audio_loop(void) {
 			while (g_audio_q.size() > 256) g_audio_q.pop_front();
 		}
 	}
-	close_wasapi(&sys);
-	close_wasapi(&mic);
+	speakers.clear();
+	mics.clear();
 	if (enumerator && notify) enumerator->UnregisterEndpointNotificationCallback(notify);
 	if (notify) notify->Release();
 	if (enumerator) enumerator->Release();
@@ -2337,6 +2745,8 @@ int recorder_start(const wchar_t *path, uint64_t hmon, const native_rec_config *
 	g_h264_nv12 = false;
 	g_encode_audio_rate_hz = 0;
 	g_limit_gain = 1.f;
+	reset_bus_level(&g_level_system);
+	reset_bus_level(&g_level_mic);
 	g_fail_code.store(0);
 	g_hmon.store(hmon ? hmon : monitor_tracker_current());
 	g_final_path = path;

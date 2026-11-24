@@ -49,6 +49,7 @@ type Audio struct {
 	System      AudioEndpoint `yaml:"system"`
 	Microphone  AudioEndpoint `yaml:"microphone"`
 	Gain        AudioGain     `yaml:"gain"`
+	AutoLevel   bool          `yaml:"auto_level"`
 	ClipLimit   bool          `yaml:"clip_limit"`
 }
 
@@ -107,6 +108,7 @@ func Default() Config {
 				SystemDB:     0,
 				MicrophoneDB: -3,
 			},
+			AutoLevel: true,
 			ClipLimit: true,
 		},
 		Output: Output{

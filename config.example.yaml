@@ -33,12 +33,13 @@
 # record.container             容器。mp4 或 h264：MP4。wmv 或其他值：WMV。
 #
 # audio.enabled                true/false。总开关，false 时不录音频。
-# audio.system.enabled         true/false。是否录系统默认扬声器。录制中更换 Windows 默认播放设备时会跟着切换。
-# audio.microphone.enabled     true/false。是否录系统默认麦克风。录制中更换 Windows 默认录音设备时会跟着切换。
+# audio.system.enabled         true/false。是否录播放设备。会同时录正在使用的各块播放设备，某一路没有数据会自动重开。
+# audio.microphone.enabled     true/false。是否录麦克风。会同时录正在使用的各块麦克风，某一路没有数据会自动重开。
 #                              占麦检测也会改到新的默认麦克风。
-# audio.gain.system_db         系统声音量，单位 dB。0 为原音量，负数变小，正数变大。
-# audio.gain.microphone_db     麦克风音量，单位 dB。0 为原音量，负数变小，正数变大。
-# audio.clip_limit             true/false。true 时混音超出 [-1, 1] 的采样直接削顶。false 时先把这一小段整体压低，避免硬削顶。
+# audio.auto_level             true/false。true 时麦克风和电脑声音各自调整：小声慢慢抬高，大声立刻压低。
+# audio.gain.system_db         系统声音量，单位 dB。自动音量打开时是在自动结果上再加减；关掉时 0 为原音量。
+# audio.gain.microphone_db     麦克风音量，单位 dB。含义与 system_db 相同。
+# audio.clip_limit             true/false。混音超过满刻度时把音量压低，避免把波形削平造成破音。
 #
 # output.dir                   保存目录。支持 %USERPROFILE%。
 # output.template              文件名模板。占位符：

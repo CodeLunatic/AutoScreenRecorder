@@ -30,6 +30,7 @@ typedef struct native_rec_config {
 	int audio_sample_rate;
 	int audio_channels;
 	int audio_bitrate_mode;
+	int auto_level;
 } native_rec_config;
 
 int native_start(native_mic_cb mic, native_monitor_cb mon);
